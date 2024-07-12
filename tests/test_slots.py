@@ -1,10 +1,8 @@
-import mock
 import os
 import unittest
-
-
-from mock import Mock, PropertyMock, patch
 from threading import Thread
+from unittest import mock
+from unittest.mock import Mock, PropertyMock, patch
 
 from patroni import global_config, psycopg
 from patroni.dcs import Cluster, ClusterConfig, Member, Status, SyncState
@@ -186,6 +184,32 @@ class TestSlotsHandler(BaseTestPostgresql):
             cluster.get_slot_name_on_primary(self.p.name, stream_node),
             'test_4')
 
+    def test_get_slot_name_on_primary(self):
+        node1 = Member(0, 'node1', 28, {
+            'state': 'running', 'conn_url': 'postgres://replicator:rep-pass@127.0.0.1:5436/postgres',
+            'tags': {'replicatefrom': 'node2'}
+        })
+        node2 = Member(0, 'node2', 28, {
+            'state': 'running', 'conn_url': 'postgres://replicator:rep-pass@127.0.0.1:5436/postgres',
+            'tags': {'replicatefrom': 'node1'}
+        })
+        cluster = Cluster(True, None, self.leader, Status.empty(), [self.leadermem, node1, node2],
+                          None, SyncState.empty(), None, None)
+        self.assertIsNone(cluster.get_slot_name_on_primary('node1', node1))
+
+    def test_should_enforce_hot_standby_feedback(self):
+        node1 = Member(0, 'postgresql0', 28, {
+            'state': 'running', 'conn_url': 'postgres://replicator:rep-pass@127.0.0.1:5436/postgres',
+            'tags': {'replicatefrom': 'postgresql1'}
+        })
+        node2 = Member(0, 'postgresql1', 28, {
+            'state': 'running', 'conn_url': 'postgres://replicator:rep-pass@127.0.0.1:5436/postgres',
+            'tags': {'replicatefrom': 'postgresql0'}
+        })
+        cluster = Cluster(True, None, self.leader, Status.empty(), [self.leadermem, node1, node2],
+                          None, SyncState.empty(), None, None)
+        self.assertFalse(cluster.should_enforce_hot_standby_feedback(self.p, node1))
+
     @patch.object(Postgresql, 'is_primary', Mock(return_value=False))
     def test__ensure_logical_slots_replica(self):
         self.p.set_role('replica')
@@ -245,9 +269,15 @@ class TestSlotsHandler(BaseTestPostgresql):
     def test_slots_advance_thread(self):
         with patch.object(MockCursor, 'execute', Mock(side_effect=psycopg.OperationalError)), \
                 patch.object(psycopg.OperationalError, 'diag') as mock_diag:
-            type(mock_diag).sqlstate = PropertyMock(return_value='58P01')
-            self.s.schedule_advance_slots({'foo': {'bar': 100}})
-            self.s._advance.sync_slots()
+            for err in ('58P01', '55000'):
+                type(mock_diag).sqlstate = PropertyMock(return_value=err)
+                self.s.schedule_advance_slots({'foo': {'bar': 100}})
+                self.s._advance.sync_slots()
+                self.assertEqual(self.s._advance._copy_slots, ["bar"])
+                # we don't want to make attempts to advance slots that are to be copied
+                self.s.schedule_advance_slots({'foo': {'bar': 101}})
+                self.assertEqual(self.s._advance._scheduled, {})
+                self.s._advance.clean()
 
         with patch.object(SlotsAdvanceThread, 'sync_slots', Mock(side_effect=Exception)):
             self.s._advance._condition.wait = Mock()
