@@ -3,6 +3,275 @@
 Release notes
 =============
 
+Version 4.0.5
+-------------
+
+Released 2025-02-20
+
+**Stability improvements**
+
+- Compatibility with ``python-json-logger>=3.1`` (Alexander Kukushkin)
+
+  Get rid of the warnings produced by the old API usage.
+
+- Compatibility with Python 3.13 (Alexander Kukushkin)
+
+  Run tests against Python 3.13.
+
+- Compatibility with ``pyinstaller>=4.4`` (Joe Jensen)
+
+  Fall back to the default ``iter_modules`` if ``pyinstaller`` ``toc`` attribute is not present.
+
+- Fix issues with PostgreSQL 9.5 support (Alexander Kukushkin)
+
+  - Properly handle ``pg_rewind`` output format.
+  - Consider ``synchronous_standby_names`` format not supporting "num" specification.
+
+- Compatibility with the latest changes in ``urlparse`` (Alexander Kukushkin)
+
+  ``urlparse`` doesn't accept multiple hosts with ``[]`` character in URL anymore. To mitigate the problem, switch to the native wrappers of ``PQconninfoParse()`` from ``libpq``, when it is possible, and use our implementation only for older ``psycopg2`` versions that are linked with an outdated version of ``libpq``.
+
+
+**Bugfixes**
+
+- Show only the members to be restarted upon restart confirmation (András Váczi)
+
+  Previously, when doing ``patronictl restart <clustername> --pending``, the confirmation listed all members, regardless of whether their restart is pending.
+
+- Cancel long-running jobs on Patroni stop and remove data directory on replica bootstrap failure (Alexander Kukushkin)
+
+  Previously, Patroni could be doing replica bootstrap, while ``pg_basebackup`` / ``wal-g`` / ``pgBackRest`` / ``barman`` or similar keep running.
+
+- Properly handle cluster names with a slash in ``patronictl edit-config`` (Antoni Mur)
+
+  Replace a forward slash in ``cluster_name`` with an underscore.
+
+- Avoid dropping physical slots too early (Alexander Kukushkin)
+
+  Postpone removal of physical replication slots containing ``xmin`` after a failover: on the new primary -- until this member is promoted, on replicas -- until there is a leader in the cluster.
+
+- Handle all exceptions raised by subprocess in ``controldata()`` (Alexander Kukushkin)
+
+  Patroni was not properly handling all exceptions possibly raised when calling ``pg_controldata`` utility.
+
+- Fix bug with a slot for a former leader not retained on failover (Alexander Kukushkin)
+
+  Avoid falsely relying on members being present in DCS, while on failover ``/member`` key for the former leader is expiring exactly at the same time.
+
+- Fix a couple of bugs in the quorum state machine (Alexander Kukushkin)
+
+  - When evaluating whether there are healthy nodes for a leader race, before demoting we need to take into account quorum requirements. Without it, the former leader may end up in recovery surrounded by asynchronous nodes.
+  - ``QuorumStateResolver`` wasn't correctly handling the case when a replica node quickly joined and disconnected.
+
+
+**Improvements**
+
+- Improve error on am empty or non-dictionary configuration file (Julian)
+
+  Throw a more explicit exception when validating if Patroni configuration file contains a valid ``Mapping`` object.
+
+
+Version 4.0.4
+-------------
+
+Released 2024-11-22
+
+**Stability improvements**
+
+- Add compatibility with the ``py-consul`` module (Alexander Kukushkin)
+
+  ``python-consul`` module is unmaintained for a long time, while ``py-consul`` is the official replacement. Backward compatibility with python-consul is retained.
+
+- Add compatibility with the ``prettytable>=3.12.0`` module (Alexander Kukushkin)
+
+  Address deprecation warnings.
+
+- Compatibility with the ``ydiff==1.4.2`` module (Alexander Kukushkin)
+
+  Fix compatibility issues for the latest version, constrain version in ``requirements.txt``, and introduce latest version compatibility test.
+
+**Bugfixes**
+
+- Run ``on_role_change`` callback after a failed primary recovery (Polina Bungina, Alexander Kukushkin)
+
+  Additionally run ``on_role_change`` callback for a primary that failed to start after a crash to increase chances the callback is executed, even if the further start as a replica fails.
+
+- Fix a thread leak in ``patronictl list -W`` (Alexander Kukushkin)
+
+  Cache DCS instance object to avoid thread leak.
+
+- Ensure only supported parameters are written to the connection string (Alexander Kukushkin)
+
+  Patroni used to pass parameters introduced in newer versions to the connection string, which had been leading to connection errors.
+
+
+Version 4.0.3
+-------------
+
+Released 2024-10-18
+
+**Bugfixes**
+
+- Disable ``pgaudit`` when creating users not to expose password (kviset)
+
+  Patroni was logging ``superuser``, ``replication``, and ``rewind`` passwords on their creation when ``pgaudit`` extension was enabled.
+
+- Fix issue with mixed setups: primary on pre-Patroni v4 and replicas on v4+ (Alexander Kukushkin)
+
+  Use ``xlog_location`` extracted from ``/members`` key instead of trying to get a member's slot position from ``/status`` key if Patroni version running on the leader is pre-4.0.0. Not doing so has been causing WALs accumulation on replicas.
+
+- Do not ignore valid PostgreSQL GUCs that don't have Patroni validator (Polina Bungina)
+
+  Still check against ``postgres --describe-config`` if a GUC does not have a Patroni validator but is, in fact, a valid GUC.
+
+
+**Improvements**
+
+- Recheck annotations on 409 status code when reading leader object in K8s (Alexander Kukushkin)
+
+  Avoid an additional update if ``PATCH`` request was canceled by Patroni, while the request successfully updated the target.
+
+- Add support of ``sslnegotiation`` client-side connection option (Alexander Kukushkin)
+
+  ``sslnegotiation`` was added to the final PostgreSQL 17 release.
+
+
+Version 4.0.2
+-------------
+
+Released 2024-09-17
+
+**Bugfixes**
+
+- Handle exceptions while discovering configuration validation files (Alexander Kukushkin)
+
+  Skip directories for which Patroni does not have sufficient permissions to perform list operations.
+
+- Make sure inactive hot physical replication slots don't hold ``xmin`` (Alexander Kukushkin, Polina Bungina)
+
+  Since version 3.2.0 Patroni creates physical replication slots for all members on replicas and periodically moves them forward using ``pg_replication_slot_advance()`` function. However if for any reason ``hot_standby_feedback`` is enabled and the primary is demoted to replica, the now inactive slots have ``NOT NULL`` ``xmin`` value propagated back to the new primary. This results in ``xmin`` horizon not being moved forward and vacuum not being able to clean up dead tuples. With this fix, Patroni recreates the physical replication slots that are supposed to be inactive but have ``NOT NULL`` ``xmin`` value.
+
+- Fix unhandled ``DCSError`` during the startup phase (Waynerv)
+
+  Ensure DCS connectivity before trying to check the uniqueness of the node name.
+
+- Explicitly include ``CMDLINE_OPTIONS`` GUCs when querying ``pg_settings`` (Alexander Kukushkin)
+
+  Make sure all GUCs that are passed to postmaster as command line parameters are restored when Patroni is joining a running standby. This is a follow-up for the bug fixed in Patroni 3.2.2.
+
+- Fix bug in ``synchronous_standby_names`` quotting logic (Alexander Kukushkin)
+
+  According to PostgreSQL documentation, ``ANY`` and ``FIRST`` keywords are supposed to be double-quoted, which Patroni did not do before.
+
+- Fix keepalive connection out-of-range issue (hadizamani021)
+
+  Ensure that ``keepalive`` option value calculated based on the ``ttl`` set does not exceed the maximum allowed value for the current platform.
+
+
+Version 4.0.1
+-------------
+
+Released 2024-08-30
+
+**Bugfix**
+
+- Patroni was creating unnecessary replication slots for itself (Alexander Kukushkin)
+
+  It was happening if ``name`` contains upper-case or special characters.
+
+
+Version 4.0.0
+-------------
+
+Released 2024-08-29
+
+.. warning::
+   - This version completes work on getting rid of the "master" term, in favor of "primary". This means a couple of breaking changes, please read the release notes carefully. Upgrading to the Patroni 4+ will work reliably only if you run Patroni 3.1.0 or newer. Upgrading from an older version directly to 4+ is possible but may lead to unexpected behavior if the primary fails while the rest of the nodes are running on other Patroni versions.
+
+
+**Breaking changes**
+
+- The following breaking changes were introduced when getting rid of the non-inclusive "master" term in the Patroni code:
+
+  - On Kubernetes, Patroni by default will set ``role`` label to ``primary``. In case if you want to keep the old behavior and avoid downtime or lengthy complex migrations, you can configure parameters ``kubernetes.leader_label_value`` and ``kubernetes.standby_leader_label_value`` to ``master``. Read more :ref:`here <kubernetes_role_values>`.
+  - Patroni role is written to DCS as ``primary`` instead of ``master``.
+  - Patroni role returned by Patroni REST API has been changed from ``master`` to ``primary``.
+  - Patroni REST API no longer accepts ``role=master`` in requests to ``/switchover``, ``/failover``, ``/restart`` endpoints.
+  - ``/metrics`` REST API endpoint will no longer report ``patroni_master`` metric.
+  - ``patronictl`` no longer accepts ``--master`` option for any command. ``--leader`` or ``--primary`` options should be used instead.
+  - ``no_master`` option in the declarative configuration of custom replica creation methods is no longer treated as a special option, please use ``no_leader`` instead.
+  - ``patroni_wale_restore`` script doesn't accept ``--no_master`` option anymore.
+  - ``patroni_barman`` script doesn't accept ``--role=master`` option anymore.
+  - All callback scripts are executed with ``role=primary`` option passed instead of ``role=master``.
+
+- ``patronictl failover`` does not accept ``--leader`` option that was deprecated since Patroni 3.2.0.
+
+- User creation functionality (``bootstrap.users`` configuration section) deprecated since Patroni 3.2.0 has been removed.
+
+
+**New features**
+
+- Quorum-based failover (Ants Aasma, Alexander Kukushkin)
+
+  The feature implements quorum-based synchronous replication (available from PostgreSQL v10) which helps to reduce worst-case latencies, even during normal operation, as a higher latency of replicating to one standby can be compensated by other standbys. Patroni implements additional safeguards to prevent any user-visible data loss by choosing a failover candidate based on the latest transaction received.
+
+- Register Citus secondaries in ``pg_dist_node`` (Alexander Kukushkin)
+
+  Patroni now maintains the list of nodes with ``role==replica``, ``state==running`` and without ``noloadbalance`` :ref:`tag <tags_settings>` in ``pg_dist_node``.
+
+- Configurable retention of members' replication slots (Alexander Kukushkin)
+
+  Implements support of ``member_slots_ttl`` global configuration parameter that controls for how long member replication slots should be kept around when the member key is absent.
+
+- Make permissions of log files created by Patroni configurable (Alexander Kukushkin)
+
+  Allows to set specific permissions for log files created by Patroni. If not specified, permissions are set based on the current ``umask`` value.
+
+- Compatibility with PostgreSQL 17 beta3 (Alexander Kukushkin)
+
+  GUC's validator rules were extended. Patroni handles all the new auxiliary backends during shutdown and sets ``dbname`` in ``primary_conninfo``, as it is required for logical replication slots synchronization.
+
+- Implement ``--ignore-listen-port`` option for Patroni config validation (Sahil Naphade)
+
+  Make it possible to ignore already bound ports when running ``patroni --validate-config``.
+
+
+**Improvements**
+
+- Make ``wal_log_hints`` configurable (Paul_Kim)
+
+  Allows to avoid the overhead of ``wal_log_hints`` configuration being enabled in case ``use_pg_rewind`` is set to ``off``.
+
+- Log ``pg_basebackup`` command in ``DEBUG`` level (Waynerv)
+
+  Facilitates failed initialization debugging.
+
+
+**Bugfixes**
+
+- Advance permanent slots for cascading nodes while in failsafe (Alexander Kukushkin)
+
+  Ensure that slots for cascading replicas are properly advanced on the primary when failsafe mode is activated. It is done by extending replicas response on ``POST /failsafe`` REST API request with their ``xlog_location``.
+
+- Don't let the current node be chosen as synchronous (Alexander Kukushkin)
+
+  There may be "something" streaming from the current primary node with ``application_name`` that matches the name of the current primary. Patroni was not properly handling this situation, which could end up in the primary being declared as a synchronous node and consequently was blocking switchovers.
+
+- Ignore ``restapi.allowlist_include_members`` for POST /failsafe (Alexander Kukushkin)
+
+- Improve GUCs validation (Polina Bungina)
+
+  Due to additional validation through running ``postgres --describe-config`` command, it was previously not possible to set GUCs not listed there through Patroni configuration. This limitation is now removed.
+
+- Add line with ``localhost`` to ``.pgpass`` file when unix sockets are detected (Alexander Kukushkin)
+
+  Patroni will add an additional line to ``.pgpass`` file if ``host`` parameter specified starts with ``/`` character. This allows to cover a corner case when ``host`` matches the default socket directory path.
+
+- Fix logging issues (Waynerv)
+
+  Defined proper request URL in failsafe handling logs and fixed the order of timestamps in postmaster check log.
+
+
 Version 3.3.2
 -------------
 
@@ -369,7 +638,7 @@ Released 2023-09-20
 
 - Don't rely on ``pg_stat_wal_receiver`` when deciding on ``pg_rewind`` (Alexander Kukushkin)
 
-  It could happen that ``received_tli`` reported by ``pg_stat_wal_recevier`` is ahead of the actual replayed timeline, while the timeline reported by ``DENTIFY_SYSTEM`` via replication connection is always correct.
+  It could happen that ``received_tli`` reported by ``pg_stat_wal_receiver`` is ahead of the actual replayed timeline, while the timeline reported by ``DENTIFY_SYSTEM`` via replication connection is always correct.
 
 
 Version 3.1.0
@@ -1429,7 +1698,7 @@ This version enhances compatibility with PostgreSQL 13, adds support of multiple
 
   Replicas are waiting for checkpoint indication via member key of the leader in DCS. The key is normally updated only once per HA loop. Without waking the main thread up, replicas will have to wait up to ``loop_wait`` seconds longer than necessary.
 
-- Use of ``pg_stat_wal_recevier`` view on 9.6+ (Alexander Kukushkin)
+- Use of ``pg_stat_wal_receiver`` view on 9.6+ (Alexander Kukushkin)
 
   The view contains up-to-date values of ``primary_conninfo`` and ``primary_slot_name``, while the contents of ``recovery.conf`` could be stale.
 
@@ -2614,7 +2883,7 @@ In addition to using Endpoints, Patroni supports ConfigMaps. You can find more i
 
   This object identifies a running postmaster process via pid and start time and simplifies detection (and resolution) of situations when the postmaster was restarted behind our back or when postgres directory disappeared from the file system.
 
-- Minimize the amount of SELECT's issued by Patroni on every loop of HA cylce (Alexander Kukushkin)
+- Minimize the amount of SELECT's issued by Patroni on every loop of HA cycle (Alexander Kukushkin)
 
   On every iteration of HA loop Patroni needs to know recovery status and absolute wal position. From now on Patroni will run only single SELECT to get this information instead of two on the replica and three on the master.
 
@@ -2638,7 +2907,7 @@ In addition to using Endpoints, Patroni supports ConfigMaps. You can find more i
 
 - Improve ``patronictl reinit`` (Alexander Kukushkin)
 
-  Sometimes ``patronictl reinit`` refused to proceed when Patroni was busy with other actions, namely trying to start postgres. `patronictl` didn't provide any commands to cancel such long running actions and the only (dangerous) workarond was removing a data directory manually. The new implementation of `reinit` forcefully cancells other long-running actions before proceeding with reinit.
+  Sometimes ``patronictl reinit`` refused to proceed when Patroni was busy with other actions, namely trying to start postgres. `patronictl` didn't provide any commands to cancel such long running actions and the only (dangerous) workarond was removing a data directory manually. The new implementation of `reinit` forcefully cancels other long-running actions before proceeding with reinit.
 
 - Implement ``--wait`` flag in ``patronictl pause`` and ``patronictl resume`` (Alexander Kukushkin)
 
@@ -2667,7 +2936,7 @@ In addition to using Endpoints, Patroni supports ConfigMaps. You can find more i
 
 - Add new /sync and /async endpoints (Alexander Kukushkin, Oleksii Kliukin)
 
- Those endpoints (also accessible as /synchronous and /asynchronous) return 200 only for synchronous and asynchronous replicas correspondingly (exclusing those marked as `noloadbalance`).
+ Those endpoints (also accessible as /synchronous and /asynchronous) return 200 only for synchronous and asynchronous replicas correspondingly (excluding those marked as `noloadbalance`).
 
 **Allow multiple hosts for Etcd**
 
@@ -2848,7 +3117,7 @@ at the end.
   Allow custom bootstrap scripts instead of ``initdb`` when initializing the very first node in the cluster.
   The bootstrap command receives the name of the cluster and the path to the data directory. The resulting cluster can
   be configured to perform recovery, making it possible to bootstrap from a backup and do point in time recovery. Refer
-  to the :ref:`documentaton page <custom_bootstrap>` for more detailed description of this feature.
+  to the :ref:`documentation page <custom_bootstrap>` for more detailed description of this feature.
 
 **Smarter pg_rewind support**
 

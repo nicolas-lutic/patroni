@@ -1,4 +1,5 @@
 from __future__ import absolute_import
+
 import json
 import logging
 import os
@@ -6,20 +7,24 @@ import re
 import socket
 import ssl
 import time
-import urllib3
 
 from collections import defaultdict
-from consul import ConsulException, NotFound, base
 from http.client import HTTPException
-from urllib3.exceptions import HTTPError
-from urllib.parse import urlencode, urlparse, quote
-from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Union, Tuple, TYPE_CHECKING
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Tuple, TYPE_CHECKING, Union
+from urllib.parse import quote, urlencode, urlparse
 
-from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, Status, SyncState, \
-    TimelineHistory, ReturnFalseException, catch_return_false_exception
+import urllib3
+
+from consul import base, Check, ConsulException, NotFound
+from urllib3.exceptions import HTTPError
+
 from ..exceptions import DCSError
+from ..postgresql.misc import PostgresqlState
 from ..postgresql.mpp import AbstractMPP
 from ..utils import deep_compare, parse_bool, Retry, RetryFailedError, split_host_port, uri, USER_AGENT
+from . import AbstractDCS, catch_return_false_exception, Cluster, ClusterConfig, \
+    Failover, Leader, Member, ReturnFalseException, Status, SyncState, TimelineHistory
+
 if TYPE_CHECKING:  # pragma: no cover
     from ..config import Config
 
@@ -188,7 +193,7 @@ class ConsulClient(base.Consul):
         return HTTPClient(**kwargs)
 
     def connect(self, *args: Any, **kwargs: Any) -> HTTPClient:
-        return self.http_connect(*args, **kwargs)
+        return self.http_connect(*args, **kwargs)  # pragma: no cover
 
     def reload_config(self, config: Dict[str, Any]) -> None:
         self.http.token = self.token = config.get('token')
@@ -522,15 +527,13 @@ class Consul(AbstractDCS):
         api_parts = api_parts._replace(path='/{0}'.format(role))
         conn_url: str = data['conn_url']
         conn_parts = urlparse(conn_url)
-        check = base.Check.http(api_parts.geturl(), self._service_check_interval,
-                                deregister='{0}s'.format(self._client.http.ttl * 10))
+        check = Check.http(api_parts.geturl(), self._service_check_interval,
+                           deregister='{0}s'.format(self._client.http.ttl * 10))
         if self._service_check_tls_server_name is not None:
             check['TLSServerName'] = self._service_check_tls_server_name
         tags = self._service_tags[:]
         tags.append(role)
-        if role == 'master':
-            tags.append('primary')
-        elif role == 'primary':
+        if role == 'primary':
             tags.append('master')
         self._previous_loop_service_tags = self._service_tags
         self._previous_loop_token = self._client.token
@@ -544,13 +547,13 @@ class Consul(AbstractDCS):
             'enable_tag_override': True,
         }
 
-        if state == 'stopped' or (not self._register_service and self._previous_loop_register_service):
+        if state == PostgresqlState.STOPPED or (not self._register_service and self._previous_loop_register_service):
             self._previous_loop_register_service = self._register_service
             return self.deregister_service(params['service_id'])
 
         self._previous_loop_register_service = self._register_service
-        if role in ['master', 'primary', 'replica', 'standby-leader']:
-            if state != 'running':
+        if role in ['primary', 'replica', 'standby-leader']:
+            if state != PostgresqlState.RUNNING:
                 return
             return self.register_service(service_name, **params)
 
@@ -680,7 +683,7 @@ class Consul(AbstractDCS):
     def set_sync_state_value(self, value: str, version: Optional[int] = None) -> Union[int, bool]:
         retry = self._retry.copy()
         ret = retry(self._client.kv.put, self.sync_path, value, cas=version)
-        if ret:  # We have no other choise, only read after write :(
+        if ret:  # We have no other choice, only read after write :(
             if not retry.ensure_deadline(0.5):
                 return False
             _, ret = self.retry(self._client.kv.get, self.sync_path, consistency='consistent')

@@ -49,7 +49,7 @@ where ``dependencies`` can be either empty, or consist of one or more of the fol
 etcd or etcd3
     `python-etcd` module in order to use Etcd as Distributed Configuration Store (DCS)
 consul
-    `python-consul` module in order to use Consul as DCS
+    `py-consul` module in order to use Consul as DCS
 zookeeper
     `kazoo` module in order to use Zookeeper as DCS
 exhibitor
@@ -62,6 +62,8 @@ aws
     `boto3` in order to use AWS callbacks
 jsonlogger
     `python-json-logger` module in order to enable :ref:`logging <log_settings>` in json format
+systemd
+    `systemd-python` in order to use sd_notify integration
 all
     all of the above (except psycopg family)
 psycopg

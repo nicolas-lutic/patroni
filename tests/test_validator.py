@@ -5,9 +5,10 @@ import tempfile
 import unittest
 
 from io import StringIO
-from unittest.mock import Mock, patch, mock_open
+from unittest.mock import Mock, mock_open, patch
+
 from patroni.dcs import dcs_modules
-from patroni.validator import schema, Directory, Schema
+from patroni.validator import Directory, populate_validate_params, schema, Schema
 
 available_dcs = [m.split(".")[-1] for m in dcs_modules()]
 config = {
@@ -69,6 +70,7 @@ config = {
     "kubernetes": {
         "namespace": "string",
         "labels": {},
+        'bootstrap_labels': {'foo': 'bar'},
         "scope_label": "string",
         "role_label": "string",
         "use_endpoints": False,
@@ -227,14 +229,13 @@ class TestValidator(unittest.TestCase):
         c["kubernetes"]["pod_ip"] = "::1"
         c["consul"]["host"] = "127.0.0.1:50000"
         c["etcd"]["host"] = "127.0.0.1:237"
-        c["postgresql"]["listen"] = "127.0.0.1:5432"
         with patch('patroni.validator.open', mock_open(read_data='9')):
             errors = schema(c)
         output = "\n".join(errors)
-        self.assertEqual(['consul.host', 'etcd.host', 'postgresql.bin_dir', 'postgresql.data_dir', 'postgresql.listen',
+        self.assertEqual(['consul.host', 'etcd.host', 'postgresql.bin_dir', 'postgresql.data_dir',
                           'raft.bind_addr', 'raft.self_addr', 'restapi.connect_address'], parse_output(output))
 
-    def test_bin_dir_is_empty_string_excutables_in_path(self, mock_out, mock_err):
+    def test_bin_dir_is_empty_string_executables_in_path(self, mock_out, mock_err):
         binaries.extend(required_binaries)
         c = copy.deepcopy(config)
         c["postgresql"]["bin_dir"] = ""
@@ -258,7 +259,7 @@ class TestValidator(unittest.TestCase):
         self.assertEqual(['raft.bind_addr', 'raft.self_addr'], parse_output(output))
 
     @patch('subprocess.check_output', Mock(return_value=b"postgres (PostgreSQL) 12.1"))
-    def test_pg_version_missmatch(self, mock_out, mock_err):
+    def test_pg_version_mismatch(self, mock_out, mock_err):
         directories.append(config["postgresql"]["data_dir"])
         directories.append(config["postgresql"]["bin_dir"])
         directories.append(os.path.join(config["postgresql"]["data_dir"], "pg_wal"))
@@ -399,3 +400,38 @@ class TestValidator(unittest.TestCase):
         errors = schema(c)
         output = "\n".join(errors)
         self.assertEqual(['postgresql.bin_dir', 'raft.bind_addr', 'raft.self_addr'], parse_output(output))
+
+    @patch('socket.socket.connect_ex', Mock(return_value=0))
+    def test_bound_port_checks_without_ignore(self, mock_out, mock_err):
+        # When ignore_listen_port is False (default case), an error should be raised if the ports are already bound.
+        c = copy.deepcopy(config)
+        c['restapi']['listen'] = "127.0.0.1:8000"
+        c['postgresql']['listen'] = "127.0.0.1:9000"
+        c['raft']['self_addr'] = "127.0.0.2:9200"
+
+        populate_validate_params(ignore_listen_port=False)
+
+        errors = schema(c)
+        output = "\n".join(errors)
+
+        self.assertEqual(['postgresql.bin_dir', 'postgresql.listen',
+                          'raft.bind_addr', 'restapi.listen'],
+                         parse_output(output))
+
+    @patch('socket.socket.connect_ex', Mock(return_value=0))
+    def test_bound_port_checks_with_ignore(self, mock_out, mock_err):
+        c = copy.deepcopy(config)
+        c['restapi']['listen'] = "127.0.0.1:8000"
+        c['postgresql']['listen'] = "127.0.0.1:9000"
+        c['raft']['self_addr'] = "127.0.0.2:9200"
+        c['raft']['bind_addr'] = "127.0.0.1:9300"
+
+        # Case: When ignore_listen_port is True, error should NOT be raised
+        # even if the ports are already bound.
+        populate_validate_params(ignore_listen_port=True)
+
+        errors = schema(c)
+        output = "\n".join(errors)
+
+        self.assertEqual(['postgresql.bin_dir'],
+                         parse_output(output))

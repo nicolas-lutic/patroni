@@ -4,13 +4,14 @@ import shlex
 import tempfile
 import time
 
-from typing import Any, Callable, Dict, List, Optional, Union, Tuple, TYPE_CHECKING
+from typing import Any, Callable, cast, Dict, List, Optional, Tuple, TYPE_CHECKING, Union
 
 from ..async_executor import CriticalTask
 from ..collections import EMPTY_DICT
 from ..dcs import Leader, Member, RemoteMember
 from ..psycopg import quote_ident, quote_literal
 from ..utils import deep_compare, unquote
+from .misc import PostgresqlState
 
 if TYPE_CHECKING:  # pragma: no cover
     from . import Postgresql
@@ -33,8 +34,7 @@ class Bootstrap(object):
         return self._running_custom_bootstrap and self._keep_existing_recovery_conf
 
     @staticmethod
-    def process_user_options(tool: str,
-                             options: Union[Any, Dict[str, str], List[Union[str, Dict[str, Any]]]],
+    def process_user_options(tool: str, options: Any,
                              not_allowed_options: Tuple[str, ...],
                              error_handler: Callable[[str], None]) -> List[str]:
         """Format *options* in a list or dictionary format into command line long form arguments.
@@ -92,20 +92,21 @@ class Bootstrap(object):
             return ret
 
         if isinstance(options, dict):
-            for key, val in options.items():
+            for key, val in cast(Dict[str, str], options).items():
                 if key and val:
                     user_options.append('--{0}={1}'.format(key, unquote(val)))
         elif isinstance(options, list):
-            for opt in options:
+            for opt in cast(List[Any], options):
                 if isinstance(opt, str) and option_is_allowed(opt):
                     user_options.append('--{0}'.format(opt))
                 elif isinstance(opt, dict):
-                    keys = list(opt.keys())
-                    if len(keys) == 1 and isinstance(opt[keys[0]], str) and option_is_allowed(keys[0]):
-                        user_options.append('--{0}={1}'.format(keys[0], unquote(opt[keys[0]])))
+                    args = cast(Dict[str, Any], opt)
+                    keys = list(args.keys())
+                    if len(keys) == 1 and isinstance(args[keys[0]], str) and option_is_allowed(keys[0]):
+                        user_options.append('--{0}={1}'.format(keys[0], unquote(args[keys[0]])))
                     else:
                         error_handler('Error when parsing {0} key-value option {1}: only one key-value is allowed'
-                                      ' and value should be a string'.format(tool, opt[keys[0]]))
+                                      ' and value should be a string'.format(tool, args[keys[0]]))
                 else:
                     error_handler('Error when parsing {0} option {1}: value should be string value'
                                   ' or a single key-value pair'.format(tool, opt))
@@ -114,7 +115,7 @@ class Bootstrap(object):
         return user_options
 
     def _initdb(self, config: Any) -> bool:
-        self._postgresql.set_state('initializing new cluster')
+        self._postgresql.set_state(PostgresqlState.INITDB)
         not_allowed_options = ('pgdata', 'nosync', 'pwfile', 'sync-only', 'version')
 
         def error_handler(e: str) -> None:
@@ -138,7 +139,7 @@ class Bootstrap(object):
         if ret:
             self._postgresql.configure_server_parameters()
         else:
-            self._postgresql.set_state('initdb failed')
+            self._postgresql.set_state(PostgresqlState.INITDB_FAILED)
         return ret
 
     def _post_restore(self) -> None:
@@ -186,7 +187,7 @@ class Bootstrap(object):
         :returns: ``True`` if the bootstrap was successful, i.e. the execution of the custom ``command`` from *config*
             exited with code ``0``, ``False`` otherwise.
         """
-        self._postgresql.set_state('running custom bootstrap script')
+        self._postgresql.set_state(PostgresqlState.CUSTOM_BOOTSTRAP)
         params = [] if config.get('no_params') else ['--scope=' + self._postgresql.scope,
                                                      '--datadir=' + self._postgresql.data_dir]
         # Add custom parameters specified by the user
@@ -196,7 +197,7 @@ class Bootstrap(object):
         try:
             logger.info('Running custom bootstrap script: %s', config['command'])
             if self._postgresql.cancellable.call(shlex.split(config['command']) + params) != 0:
-                self._postgresql.set_state('custom bootstrap failed')
+                self._postgresql.set_state(PostgresqlState.CUSTOM_BOOTSTRAP_FAILED)
                 return False
         except Exception:
             logger.exception('Exception during custom bootstrap')
@@ -241,7 +242,7 @@ class Bootstrap(object):
             loop through all methods the user supplies
         """
 
-        self._postgresql.set_state('creating replica')
+        self._postgresql.set_state(PostgresqlState.CREATING_REPLICA)
         self._postgresql.schedule_sanity_checks_after_pause()
 
         is_remote_member = isinstance(clone_member, RemoteMember)
@@ -301,7 +302,7 @@ class Bootstrap(object):
                                           "datadir": self._postgresql.data_dir,
                                           "connstring": connstring})
                 else:
-                    for param in ('no_params', 'no_master', 'no_leader', 'keep_data'):
+                    for param in ('no_params', 'no_leader', 'keep_data'):
                         method_config.pop(param, None)
                 params = ["--{0}={1}".format(arg, val) for arg, val in method_config.items()]
                 try:
@@ -318,7 +319,11 @@ class Bootstrap(object):
                     logger.exception('Error creating replica using method %s', replica_method)
                     ret = 1
 
-        self._postgresql.set_state('stopped')
+                # replica creation method failed, clean up data directory if configuration allows
+                if not method_config.get('keep_data', False) and not self._postgresql.data_directory_empty():
+                    self._postgresql.remove_data_directory()
+
+        self._postgresql.set_state(PostgresqlState.STOPPED)
         return ret
 
     def basebackup(self, conn_url: str, env: Dict[str, str], options: Dict[str, Any]) -> Optional[int]:
@@ -359,6 +364,9 @@ class Bootstrap(object):
             if bbfailures < maxfailures - 1:
                 logger.warning('Trying again in 5 seconds')
                 time.sleep(5)
+            elif not self._postgresql.data_directory_empty():
+                # pg_basebackup failed, clean up data directory
+                self._postgresql.remove_data_directory()
 
         return ret
 
@@ -411,6 +419,7 @@ END;$$""".format(quote_literal(name), quote_ident(name, self._postgresql.connect
         self._postgresql.query('SET log_min_duration_statement TO -1')
         self._postgresql.query("SET log_min_error_statement TO 'log'")
         self._postgresql.query("SET pg_stat_statements.track_utility to 'off'")
+        self._postgresql.query("SET pgaudit.log TO none")
         try:
             self._postgresql.query(sql)
         finally:
@@ -418,6 +427,7 @@ END;$$""".format(quote_literal(name), quote_ident(name, self._postgresql.connect
             self._postgresql.query('RESET log_min_duration_statement')
             self._postgresql.query('RESET log_statement')
             self._postgresql.query('RESET pg_stat_statements.track_utility')
+            self._postgresql.query('RESET pgaudit.log')
 
     def post_bootstrap(self, config: Dict[str, Any], task: CriticalTask) -> Optional[bool]:
         try:
@@ -444,11 +454,8 @@ END;$$""".format(f, quote_ident(rewind['username'], postgresql.connection()))
                         postgresql.query(sql)
 
                 if config.get('users'):
-                    logger.warning('User creation via "bootstrap.users" will be removed in v4.0.0')
-
-                for name, value in (config.get('users') or EMPTY_DICT).items():
-                    if all(name != a.get('username') for a in (superuser, replication, rewind)):
-                        self.create_or_update_role(name, value.get('password'), value.get('options', []))
+                    logger.error('User creation is not be supported starting from v4.0.0. '
+                                 'Please use "bootstrap.post_bootstrap" script to create users.')
 
                 # We were doing a custom bootstrap instead of running initdb, therefore we opened trust
                 # access from certain addresses to be able to reach cluster and change password

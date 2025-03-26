@@ -1,15 +1,16 @@
 """Facilities related to Patroni configuration."""
-import re
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
-import yaml
 
 from collections import defaultdict
 from copy import deepcopy
-from typing import Any, Callable, Collection, Dict, List, Optional, Union, TYPE_CHECKING
+from typing import Any, Callable, cast, Collection, Dict, List, Optional, TYPE_CHECKING, Union
+
+import yaml
 
 from . import PATRONI_ENV_PREFIX
 from .collections import CaseInsensitiveDict, EMPTY_DICT
@@ -17,8 +18,8 @@ from .dcs import ClusterConfig
 from .exceptions import ConfigParseError
 from .file_perm import pg_perm
 from .postgresql.config import ConfigHandler
-from .validator import IntValidator
 from .utils import deep_compare, parse_bool, parse_int, patch_config
+from .validator import IntValidator
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,8 @@ _AUTH_ALLOWED_PARAMETERS = (
     'sslcrl',
     'sslcrldir',
     'gssencmode',
-    'channel_binding'
+    'channel_binding',
+    'sslnegotiation'
 )
 
 
@@ -145,7 +147,7 @@ class Config(object):
         self._cache_file = os.path.join(self._data_dir, self.__CACHE_FILENAME)
         if validator:  # patronictl uses validator=None
             self._load_cache()  # we don't want to load anything from local cache for ctl
-            self._validate_failover_tags()  # irrelevant for ctl
+            self._validate_contradictory_tags()  # irrelevant for ctl
         self._cache_needs_saving = False
 
     @property
@@ -186,6 +188,7 @@ class Config(object):
 
         :raises:
             :class:`ConfigParseError`: if *path* is invalid.
+            :class:`ConfigParseError`: if *path* does not contain dict (empty file or no mapping values).
         """
         if os.path.isfile(path):
             files = [path]
@@ -200,7 +203,10 @@ class Config(object):
         for fname in files:
             with open(fname) as f:
                 config = yaml.safe_load(f)
-                patch_config(overall_config, config)
+                if not isinstance(config, dict):
+                    logger.error('%s does not contain a dict', fname)
+                    raise ConfigParseError(f'invalid config file {fname}')
+                patch_config(overall_config, cast(Dict[Any, Any], config))
         return overall_config
 
     def _load_config_file(self) -> Dict[str, Any]:
@@ -357,7 +363,7 @@ class Config(object):
                     new_configuration = self._build_effective_configuration(self._dynamic_configuration, configuration)
                     self._local_configuration = configuration
                     self.__effective_configuration = new_configuration
-                    self._validate_failover_tags()
+                    self._validate_contradictory_tags()
                     return True
                 else:
                     logger.info('No local configuration items changed.')
@@ -535,7 +541,8 @@ class Config(object):
         _set_section_values('postgresql', ['listen', 'connect_address', 'proxy_address',
                                            'config_dir', 'data_dir', 'pgpass', 'bin_dir'])
         _set_section_values('log', ['type', 'level', 'traceback_level', 'format', 'dateformat', 'static_fields',
-                                    'max_queue_size', 'dir', 'file_size', 'file_num', 'loggers'])
+                                    'max_queue_size', 'dir', 'mode', 'file_size', 'file_num', 'loggers',
+                                    'deduplicate_heartbeat_logs'])
         _set_section_values('raft', ['data_dir', 'self_addr', 'partner_addrs', 'password', 'bind_addr'])
 
         for binary in ('pg_ctl', 'initdb', 'pg_controldata', 'pg_basebackup', 'postgres', 'pg_isready', 'pg_rewind'):
@@ -544,7 +551,8 @@ class Config(object):
                 ret['postgresql'].setdefault('bin_name', {})[binary] = value
 
         # parse all values retrieved from the environment as Python objects, according to the expected type
-        for first, second in (('restapi', 'allowlist_include_members'), ('ctl', 'insecure')):
+        for first, second in (('restapi', 'allowlist_include_members'), ('ctl', 'insecure'),
+                              ('log', 'deduplicate_heartbeat_logs')):
             value = ret.get(first, {}).pop(second, None)
             if value:
                 value = parse_bool(value)
@@ -552,7 +560,7 @@ class Config(object):
                     ret[first][second] = value
 
         for first, params in (('restapi', ('request_queue_size',)),
-                              ('log', ('max_queue_size', 'file_size', 'file_num'))):
+                              ('log', ('max_queue_size', 'file_size', 'file_num', 'mode'))):
             for second in params:
                 value = ret.get(first, {}).pop(second, None)
                 if value:
@@ -655,7 +663,7 @@ class Config(object):
                               'SERVICE_TAGS', 'NAMESPACE', 'CONTEXT', 'USE_ENDPOINTS', 'SCOPE_LABEL', 'ROLE_LABEL',
                               'POD_IP', 'PORTS', 'LABELS', 'BYPASS_API_SERVICE', 'RETRIABLE_HTTP_CODES', 'KEY_PASSWORD',
                               'USE_SSL', 'SET_ACLS', 'GROUP', 'DATABASE', 'LEADER_LABEL_VALUE', 'FOLLOWER_LABEL_VALUE',
-                              'STANDBY_LEADER_LABEL_VALUE', 'TMP_ROLE_LABEL', 'AUTH_DATA') and name:
+                              'STANDBY_LEADER_LABEL_VALUE', 'TMP_ROLE_LABEL', 'AUTH_DATA', 'BOOTSTRAP_LABELS') and name:
                     value = os.environ.pop(param)
                     if name == 'CITUS':
                         if suffix == 'GROUP':
@@ -666,7 +674,7 @@ class Config(object):
                         value = value and parse_int(value)
                     elif suffix in ('HOSTS', 'PORTS', 'CHECKS', 'SERVICE_TAGS', 'RETRIABLE_HTTP_CODES'):
                         value = value and _parse_list(value)
-                    elif suffix in ('LABELS', 'SET_ACLS', 'AUTH_DATA'):
+                    elif suffix in ('LABELS', 'SET_ACLS', 'AUTH_DATA', 'BOOTSTRAP_LABELS'):
                         value = _parse_dict(value)
                     elif suffix in ('USE_PROXIES', 'REGISTER_SERVICE', 'USE_ENDPOINTS', 'BYPASS_API_SERVICE', 'VERIFY'):
                         value = parse_bool(value)
@@ -675,23 +683,6 @@ class Config(object):
         for dcs in ('etcd', 'etcd3'):
             if dcs in ret:
                 ret[dcs].update(_get_auth(dcs))
-
-        users = {}
-        for param in list(os.environ.keys()):
-            if param.startswith(PATRONI_ENV_PREFIX):
-                name, suffix = (param[len(PATRONI_ENV_PREFIX):].rsplit('_', 1) + [''])[:2]
-                # PATRONI_<username>_PASSWORD=<password>, PATRONI_<username>_OPTIONS=<option1,option2,...>
-                # CREATE USER "<username>" WITH <OPTIONS> PASSWORD '<password>'
-                if name and suffix == 'PASSWORD':
-                    password = os.environ.pop(param)
-                    if password:
-                        users[name] = {'password': password}
-                        options = os.environ.pop(param[:-9] + '_OPTIONS', None)  # replace "_PASSWORD" with "_OPTIONS"
-                        options = options and _parse_list(options)
-                        if options:
-                            users[name]['options'] = options
-        if users:
-            ret['bootstrap']['users'] = users
 
         return ret
 
@@ -710,8 +701,8 @@ class Config(object):
         config = self._safe_copy_dynamic_configuration(dynamic_configuration)
         for name, value in local_configuration.items():
             if name == 'citus':  # remove invalid citus configuration
-                if isinstance(value, dict) and isinstance(value.get('group'), int)\
-                        and isinstance(value.get('database'), str):
+                if isinstance(value, dict) and isinstance(cast(Dict[str, Any], value).get('group'), int) \
+                        and isinstance(cast(Dict[str, Any], value).get('database'), str):
                     config[name] = value
             elif name == 'postgresql':
                 for name, value in (value or {}).items():
@@ -756,7 +747,7 @@ class Config(object):
         if 'citus' in config:
             bootstrap = config.setdefault('bootstrap', {})
             dcs = bootstrap.setdefault('dcs', {})
-            dcs.setdefault('synchronous_mode', True)
+            dcs.setdefault('synchronous_mode', 'quorum')
 
         updated_fields = (
             'name',
@@ -813,25 +804,31 @@ class Config(object):
         """
         return deepcopy(self.__effective_configuration)
 
-    def _validate_failover_tags(self) -> None:
-        """Check ``nofailover``/``failover_priority`` config and warn user if it's contradictory.
+    def _validate_contradictory_tags(self) -> None:
+        """Check boolean/priority tags' config and warn user if it's contradictory.
 
         .. note::
-          To preserve sanity (and backwards compatibility) the ``nofailover`` tag will still exist. A contradictory
-          configuration is one where ``nofailover`` is ``True`` but ``failover_priority > 0``, or where
-          ``nofailover`` is ``False``, but ``failover_priority <= 0``. Essentially, ``nofailover`` and
-          ``failover_priority`` are communicating different things.
+          To preserve sanity (and backwards compatibility) the ``nofailover``/``nosync`` tag will still exist.
+          A contradictory configuration is one where ``nofailover``/``nosync`` is ``True`` but
+          ``failover_priority > 0``/``sync_priority > 0``, or where ``nofailover``/``nosync`` is ``False``,
+          but ``failover_priority <= 0``/``sync_priority <= 0``. Essentially, ``nofailover``/``nosync`` and
+          ``failover_priority``/``sync_priority`` are communicating different things.
           This checks for this edge case (which is a misconfiguration on the part of the user) and warns them.
-          The behaviour is as if ``failover_priority`` were not provided (i.e ``nofailover`` is the
-          bedrock source of truth)
+          The behaviour is as if ``failover_priority``/``sync_priority`` were not provided
+          (i.e ``nofailover``/``nosync`` is the bedrock source of truth).
         """
         tags = self.get('tags', {})
-        if 'nofailover' not in tags:
-            return
-        nofailover_tag = tags.get('nofailover')
-        failover_priority_tag = parse_int(tags.get('failover_priority'))
-        if failover_priority_tag is not None \
-                and (bool(nofailover_tag) is True and failover_priority_tag > 0
-                     or bool(nofailover_tag) is False and failover_priority_tag <= 0):
-            logger.warning('Conflicting configuration between nofailover: %s and failover_priority: %s. '
-                           'Defaulting to nofailover: %s', nofailover_tag, failover_priority_tag, nofailover_tag)
+
+        def validate_tag(bool_name: str, priority_name: str) -> None:
+            if bool_name not in tags:
+                return
+            bool_tag = tags.get(bool_name)
+            priority_tag = parse_int(tags.get(priority_name))
+            if priority_tag is not None \
+                    and (bool(bool_tag) is True and priority_tag > 0
+                         or bool(bool_tag) is False and priority_tag <= 0):
+                logger.warning('Conflicting configuration between %s: %s and %s: %s. Defaulting to %s: %s',
+                               bool_name, bool_tag, priority_name, priority_tag, bool_name, bool_tag)
+
+        validate_tag('nofailover', 'failover_priority')
+        validate_tag('nosync', 'sync_priority')

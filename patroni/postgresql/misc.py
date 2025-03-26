@@ -2,11 +2,36 @@ import errno
 import logging
 import os
 
+from enum import Enum
 from typing import Iterable, Tuple
 
 from ..exceptions import PostgresException
 
 logger = logging.getLogger(__name__)
+
+
+class PostgresqlState(str, Enum):
+    """Possible values of :attr:`Postgresql.state`."""
+
+    INITDB = 'initializing new cluster'
+    INITDB_FAILED = 'initdb failed'
+    CUSTOM_BOOTSTRAP = 'running custom bootstrap script'
+    CUSTOM_BOOTSTRAP_FAILED = 'custom bootstrap failed'
+    CREATING_REPLICA = 'creating replica'
+    RUNNING = 'running'
+    STARTING = 'starting'
+    BOOTSTRAP_STARTING = 'starting after custom bootstrap'
+    START_FAILED = 'start failed'
+    RESTARTING = 'restarting'
+    RESTART_FAILED = 'restart failed'
+    STOPPING = 'stopping'
+    STOPPED = 'stopped'
+    STOP_FAILED = 'stop failed'
+    CRASHED = 'crashed'
+
+    def __repr__(self) -> str:
+        """Get a string representation of a :class:`PostgresqlState` member."""
+        return self.value
 
 
 def postgres_version_to_int(pg_version: str) -> int:
@@ -55,6 +80,24 @@ def postgres_major_version_to_int(pg_version: str) -> int:
     90600
     """
     return postgres_version_to_int(pg_version + '.0')
+
+
+def get_major_from_minor_version(version: int) -> int:
+    """Extract major PostgreSQL version from the provided full version.
+
+    :param version: integer representation of PostgreSQL full version (major + minor).
+
+    :returns: integer representation of the PostgreSQL major version.
+
+    :Example:
+
+        >>> get_major_from_minor_version(100012)
+        100000
+
+        >>> get_major_from_minor_version(90313)
+        90300
+    """
+    return version // 100 * 100
 
 
 def parse_lsn(lsn: str) -> int:

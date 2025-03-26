@@ -1,14 +1,15 @@
 import abc
-from copy import deepcopy
 import logging
-import yaml
 
+from copy import deepcopy
 from typing import Any, Dict, Iterator, List, MutableMapping, Optional, Tuple, Type, Union
 
-from .available_parameters import get_validator_files, PathLikeObj
+import yaml
+
 from ..collections import CaseInsensitiveDict, CaseInsensitiveSet
 from ..exceptions import PatroniException
 from ..utils import parse_bool, parse_int, parse_real
+from .available_parameters import get_validator_files, PathLikeObj
 
 logger = logging.getLogger(__name__)
 
@@ -423,26 +424,22 @@ def _transform_parameter_value(validators: MutableMapping[str, Tuple[_Transforma
     :param name: name of the Postgres GUC.
     :param value: value of the Postgres GUC.
     :param available_gucs: a set of all GUCs available in Postgres *version*. Each item is the name of a Postgres
-        GUC. Used for a couple purposes:
-
-        * Disallow writing GUCs to ``postgresql.conf`` (or ``recovery.conf``) that does not exist in Postgres *version*;
-        * Avoid ignoring GUC *name* if it does not have a validator in *validators*, but is a valid GUC in Postgres
-          *version*.
+        GUC. Used to avoid ignoring GUC *name* if it does not have a validator in *validators*, but is a valid GUC
+        in Postgres *version*.
 
     :returns: the return value may be one among:
 
-        * *value* transformed to the expected format for GUC *name* in Postgres *version*, if *name* is present
-          in *available_gucs* and has a validator in *validators* for the corresponding Postgres *version*; or
-        * The own *value* if *name* is present in *available_gucs* but not in *validators*; or
-        * ``None`` if *name* is not present in *available_gucs*.
+        * *value* transformed to the expected format for GUC *name* in Postgres *version*, if *name* has a validator
+          in *validators* for the corresponding Postgres *version*; or
+        * ``None`` if *name* does not have a validator in *validators* and is not present in *available_gucs*.
     """
+    for validator in validators.get(name, ()) or ():
+        if version >= validator.version_from and\
+                (validator.version_till is None or version < validator.version_till):
+            return validator.transform(name, value)
+    # Ideally we should have a validator in *validators*. However, if none is available, we will not discard a
+    # setting that exists in Postgres *version*, but rather allow the value with no validation.
     if name in available_gucs:
-        for validator in validators.get(name, ()) or ():
-            if version >= validator.version_from and\
-                    (validator.version_till is None or version < validator.version_till):
-                return validator.transform(name, value)
-        # Ideally we should have a validator in *validators*. However, if none is available, we will not discard a
-        # setting that exists in Postgres *version*, but rather allow the value with no validation.
         return value
     logger.warning('Removing unexpected parameter=%s value=%s from the config', name, value)
 
@@ -455,11 +452,8 @@ def transform_postgresql_parameter_value(version: int, name: str, value: Any,
     :param name: name of the Postgres GUC.
     :param value: value of the Postgres GUC.
     :param available_gucs: a set of all GUCs available in Postgres *version*. Each item is the name of a Postgres
-        GUC. Used for a couple purposes:
-
-            * Disallow writing GUCs to ``postgresql.conf`` that does not exist in Postgres *version*;
-            * Avoid ignoring GUC *name* if it does not have a validator in ``parameters``, but is a valid GUC in
-                Postgres *version*.
+        GUC. Used to avoid ignoring GUC *name* if it does not have a validator in ``parameters``, but is a valid GUC in
+        Postgres *version*.
 
     :returns: The return value may be one among:
 
@@ -485,12 +479,8 @@ def transform_recovery_parameter_value(version: int, name: str, value: Any,
     :param name: name of the Postgres recovery GUC.
     :param value: value of the Postgres recovery GUC.
     :param available_gucs: a set of all GUCs available in Postgres *version*. Each item is the name of a Postgres
-        GUC. Used for a couple purposes:
-
-            * Disallow writing GUCs to ``recovery.conf`` (or ``postgresql.conf`` depending on *version*), that does not
-                exist in Postgres *version*;
-            * Avoid ignoring recovery GUC *name* if it does not have a validator in ``recovery_parameters``, but is a
-                valid GUC in Postgres *version*.
+        GUC. Used to avoid ignoring GUC *name* if it does not have a validator in ``parameters``, but is a valid GUC in
+        Postgres *version*.
 
     :returns: *value* transformed to the expected format for recovery GUC *name* in Postgres *version* using validators
         defined in ``recovery_parameters``. It can also return ``None``. See :func:`_transform_parameter_value`.

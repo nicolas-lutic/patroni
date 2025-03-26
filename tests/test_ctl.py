@@ -1,28 +1,40 @@
-import click
-import etcd
 import os
 import unittest
 
-from click.testing import CliRunner
 from datetime import datetime, timedelta
+from unittest import mock
+from unittest.mock import Mock, patch, PropertyMock
+
+import click
+import etcd
+
+from click.testing import CliRunner
+from prettytable import PrettyTable
+
+from patroni.postgresql.misc import PostgresqlState
+
+try:
+    from prettytable import HRuleStyle
+    hrule_all = HRuleStyle.ALL
+except ImportError:
+    from prettytable import ALL as hrule_all
+
+from urllib3 import PoolManager
+
 from patroni import global_config
-from patroni.ctl import ctl, load_config, output_members, get_dcs, parse_dcs, \
-    get_all_members, get_any_member, get_cursor, query_member, PatroniCtlException, apply_config_changes, \
-    format_config_for_editing, show_diff, invoke_editor, format_pg_version, CONFIG_FILE_PATH, PatronictlPrettyTable
+from patroni.ctl import apply_config_changes, CONFIG_FILE_PATH, ctl, format_config_for_editing, \
+    format_pg_version, get_all_members, get_any_member, get_cursor, get_dcs, invoke_editor, load_config, \
+    output_members, parse_dcs, PatroniCtlException, PatronictlPrettyTable, query_member, show_diff
 from patroni.dcs import Cluster, Failover
 from patroni.postgresql.config import get_param_diff
 from patroni.postgresql.mpp import get_mpp
 from patroni.psycopg import OperationalError
 from patroni.utils import tzutc
-from prettytable import PrettyTable, ALL
-from unittest import mock
-from unittest.mock import patch, Mock, PropertyMock
-from urllib3 import PoolManager
 
 from . import MockConnect, MockCursor, MockResponse, psycopg_connect
 from .test_etcd import etcd_read, socket_getaddrinfo
-from .test_ha import get_cluster_initialized_without_leader, get_cluster_initialized_with_leader, \
-    get_cluster_initialized_with_only_leader, get_cluster_not_initialized_without_leader, get_cluster, Member
+from .test_ha import get_cluster, get_cluster_initialized_with_leader, get_cluster_initialized_with_only_leader, \
+    get_cluster_initialized_without_leader, get_cluster_not_initialized_without_leader, Member
 
 
 def get_default_config(*args):
@@ -40,7 +52,7 @@ def get_default_config(*args):
 @patch('patroni.ctl.load_config', get_default_config)
 @patch('patroni.dcs.AbstractDCS.get_cluster', Mock(return_value=get_cluster_initialized_with_leader()))
 class TestCtl(unittest.TestCase):
-    TEST_ROLES = ('master', 'primary', 'leader')
+    TEST_ROLES = ('primary', 'leader')
 
     @patch('socket.getaddrinfo', socket_getaddrinfo)
     def setUp(self):
@@ -228,12 +240,6 @@ class TestCtl(unittest.TestCase):
         self.assertIn("Candidate ['other']", result.output)
         self.assertIn('Member leader is already the leader of cluster dummy', result.output)
 
-        # Temp test to check a fallback to switchover if leader is specified
-        with patch('patroni.ctl._do_failover_or_switchover') as failover_func_mock:
-            result = self.runner.invoke(ctl, ['failover', '--leader', 'leader', 'dummy'], input='0\n')
-            self.assertIn('Supplying a leader name using this command is deprecated', result.output)
-            failover_func_mock.assert_called_once_with('switchover', 'dummy', None, 'leader', None, False)
-
         cluster = get_cluster_initialized_with_leader(sync=('leader', 'other'))
         cluster.members.append(Member(0, 'async', 28, {'api_url': 'http://127.0.0.1:8012/patroni'}))
         cluster.config.data['synchronous_mode'] = True
@@ -252,8 +258,8 @@ class TestCtl(unittest.TestCase):
     @patch('patroni.dynamic_loader.iter_modules', Mock(return_value=['patroni.dcs.dummy', 'patroni.dcs.etcd']))
     def test_get_dcs(self):
         with click.Context(click.Command('list')) as ctx:
-            ctx.obj = {'__config': {'dummy': {}}, '__mpp': get_mpp({})}
-            self.assertRaises(PatroniCtlException, get_dcs, 'dummy', 0)
+            ctx.obj = {'__config': {'dummy2': {}}, '__mpp': get_mpp({})}
+            self.assertRaises(PatroniCtlException, get_dcs, 'dummy2', 0)
 
     @patch('patroni.psycopg.connect', psycopg_connect)
     @patch('patroni.ctl.query_member', Mock(return_value=([['mock column']], None)))
@@ -395,6 +401,13 @@ class TestCtl(unittest.TestCase):
         result = self.runner.invoke(ctl, ctl_args, input='y')
         assert result.exit_code == 0
 
+        ctl_args = ['restart', 'alpha', '--pg-version', '99.0', '--pending', '--scheduled', '2300-10-01T14:30']
+        # normal restart, the schedule is actually parsed, but not validated in patronictl
+        mock_post.return_value.status = 200
+        result = self.runner.invoke(ctl, ctl_args, input='y')
+        assert result.exit_code == 0
+        assert 'might be different from the ones' in result.output
+
         # get restart with the non-200 return code
         # normal restart, the schedule is actually parsed, but not validated in patronictl
         mock_post.return_value.status = 204
@@ -515,11 +528,11 @@ class TestCtl(unittest.TestCase):
         cluster = get_cluster_initialized_with_leader()
         cluster.members.append(Member(0, 'cascade', 28,
                                       {'conn_url': 'postgres://replicator:rep-pass@127.0.0.1:5437/postgres',
-                                       'api_url': 'http://127.0.0.1:8012/patroni', 'state': 'running',
+                                       'api_url': 'http://127.0.0.1:8012/patroni', 'state': PostgresqlState.RUNNING,
                                        'tags': {'replicatefrom': 'other'}}))
         cluster.members.append(Member(0, 'wrong_cascade', 28,
                                       {'conn_url': 'postgres://replicator:rep-pass@127.0.0.1:5438/postgres',
-                                       'api_url': 'http://127.0.0.1:8013/patroni', 'state': 'running',
+                                       'api_url': 'http://127.0.0.1:8013/patroni', 'state': PostgresqlState.RUNNING,
                                        'tags': {'replicatefrom': 'nonexistinghost'}}))
         with patch('patroni.dcs.AbstractDCS.get_cluster', Mock(return_value=cluster)):
             result = self.runner.invoke(ctl, ['topology', 'dummy'])
@@ -685,6 +698,17 @@ class TestCtl(unittest.TestCase):
         show_diff(b"foo:\n  bar: \xc3\xb6\xc3\xb6\n".decode('utf-8'),
                   b"foo:\n  bar: \xc3\xbc\xc3\xbc\n".decode('utf-8'))
 
+    @patch('subprocess.Popen')
+    @patch('os.environ.get', Mock(return_value='cat'))
+    @patch('sys.stdout.isatty', Mock(return_value=True))
+    @patch('shutil.which', Mock(return_value='cat'))
+    def test_show_diff_pager(self, mock_popen):
+        show_diff("foo:\n  bar: 1\n", "foo:\n  bar: 2\n")
+        self.assertEqual(mock_popen.return_value.stdin.write.call_count, 6)
+        self.assertIn(b' bar: ', mock_popen.return_value.stdin.write.call_args_list[5][0][0])
+        self.assertIn(b' bar: ', mock_popen.return_value.stdin.write.call_args_list[4][0][0])
+        self.assertIn(b' foo:', mock_popen.return_value.stdin.write.call_args_list[3][0][0])
+
     @patch('subprocess.call', return_value=1)
     def test_invoke_editor(self, mock_subprocess_call):
         os.environ.pop('EDITOR', None)
@@ -750,7 +774,7 @@ class TestCtl(unittest.TestCase):
 class TestPatronictlPrettyTable(unittest.TestCase):
 
     def setUp(self):
-        self.pt = PatronictlPrettyTable(' header', ['foo', 'bar'], hrules=ALL)
+        self.pt = PatronictlPrettyTable(' header', ['foo', 'bar'], hrules=hrule_all)
 
     def test__get_hline(self):
         expected = '+-----+-----+'

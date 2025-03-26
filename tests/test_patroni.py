@@ -1,22 +1,26 @@
-import etcd
 import logging
 import os
 import signal
 import time
 import unittest
-from unittest.mock import Mock, PropertyMock, patch
+
+from http.server import HTTPServer
+from threading import Thread
+from unittest.mock import Mock, patch, PropertyMock
+
+import etcd
 
 import patroni.config as config
-from http.server import HTTPServer
+
+from patroni.__main__ import check_psycopg, main as _main, Patroni
 from patroni.api import RestApiServer
 from patroni.async_executor import AsyncExecutor
-from patroni.dcs import Cluster, Member
+from patroni.dcs import Cluster, ClusterConfig, Member
 from patroni.dcs.etcd import AbstractEtcdClientWithFailover
 from patroni.exceptions import DCSError
 from patroni.postgresql import Postgresql
 from patroni.postgresql.config import ConfigHandler
-from patroni.__main__ import check_psycopg, Patroni, main as _main
-from threading import Thread
+from patroni.postgresql.misc import PostgresqlState
 
 from . import psycopg_connect, SleepException
 from .test_etcd import etcd_read, etcd_write
@@ -61,11 +65,12 @@ class TestPatroni(unittest.TestCase):
     def test_no_config(self):
         self.assertRaises(SystemExit, _main)
 
-    @patch('sys.argv', ['patroni.py', '--validate-config', 'postgres0.yml'])
+    @patch('sys.argv', ['patroni.py', '--print', '--validate-config', 'postgres0.yml'])
     @patch('socket.socket.connect_ex', Mock(return_value=1))
     def test_validate_config(self):
         self.assertRaises(SystemExit, _main)
-        with patch.object(config.Config, '__init__', Mock(return_value=None)):
+        with patch.object(config.Config, '__init__', Mock(return_value=None)), \
+             patch.object(config.Config, 'local_configuration', PropertyMock(return_value={})):
             self.assertRaises(SystemExit, _main)
 
     @patch('pkgutil.iter_importers', Mock(return_value=[MockFrozenImporter()]))
@@ -88,11 +93,21 @@ class TestPatroni(unittest.TestCase):
     def tearDown(self):
         logging.getLogger().handlers[:] = self._handlers
 
-    @patch('patroni.dcs.AbstractDCS.get_cluster', Mock(side_effect=[None, DCSError('foo'), None]))
-    def test_load_dynamic_configuration(self):
+    def test_apply_dynamic_configuration(self):
+        empty_cluster = Cluster.empty()
         self.p.config._dynamic_configuration = {}
-        self.p.load_dynamic_configuration()
-        self.p.load_dynamic_configuration()
+        self.p.apply_dynamic_configuration(empty_cluster)
+        self.assertEqual(self.p.config._dynamic_configuration['ttl'], 30)
+
+        without_config = empty_cluster._asdict()
+        del without_config['config']
+        cluster = Cluster(
+            config=ClusterConfig(version=1, modify_version=1, data={"ttl": 40}),
+            **without_config
+        )
+        self.p.config._dynamic_configuration = {}
+        self.p.apply_dynamic_configuration(cluster)
+        self.assertEqual(self.p.config._dynamic_configuration['ttl'], 40)
 
     @patch('sys.argv', ['patroni.py', 'postgres0.yml'])
     @patch('time.sleep', Mock(side_effect=SleepException))
@@ -145,7 +160,7 @@ class TestPatroni(unittest.TestCase):
     @patch('patroni.config.Config.save_cache', Mock())
     @patch('patroni.config.Config.reload_local_configuration', Mock(return_value=True))
     @patch('patroni.ha.Ha.is_leader', Mock(return_value=True))
-    @patch.object(Postgresql, 'state', PropertyMock(return_value='running'))
+    @patch.object(Postgresql, 'state', PropertyMock(return_value=PostgresqlState.RUNNING))
     @patch.object(Postgresql, 'data_directory_empty', Mock(return_value=False))
     def test_run(self):
         self.p.postgresql.set_role('replica')
@@ -187,6 +202,12 @@ class TestPatroni(unittest.TestCase):
         self.assertEqual(self.p._filter_tags(tags), tags)
 
         tags = {'nofailover': True, 'failover_priority': 1}
+        self.assertEqual(self.p._filter_tags(tags), tags)
+
+        tags = {'nosync': False, 'sync_priority': 0}
+        self.assertEqual(self.p._filter_tags(tags), tags)
+
+        tags = {'nosync': True, 'sync_priority': 1}
         self.assertEqual(self.p._filter_tags(tags), tags)
 
     def test_noloadbalance(self):
@@ -275,11 +296,9 @@ class TestPatroni(unittest.TestCase):
 
     def test_ensure_unique_name(self):
         # None/empty cluster implies unique name
-        with patch('patroni.dcs.AbstractDCS.get_cluster', Mock(return_value=None)):
-            self.assertIsNone(self.p.ensure_unique_name())
+        self.assertIsNone(self.p.ensure_unique_name(None))
         empty_cluster = Cluster.empty()
-        with patch('patroni.dcs.AbstractDCS.get_cluster', Mock(return_value=empty_cluster)):
-            self.assertIsNone(self.p.ensure_unique_name())
+        self.assertIsNone(self.p.ensure_unique_name(empty_cluster))
         without_members = empty_cluster._asdict()
         del without_members['members']
 
@@ -288,8 +307,7 @@ class TestPatroni(unittest.TestCase):
             members=[Member(version=1, name="distinct", session=1, data={})],
             **without_members
         )
-        with patch('patroni.dcs.AbstractDCS.get_cluster', Mock(return_value=okay_cluster)):
-            self.assertIsNone(self.p.ensure_unique_name())
+        self.assertIsNone(self.p.ensure_unique_name(okay_cluster))
 
         # Cluster with a member with the same name that is running
         bad_cluster = Cluster(
@@ -298,10 +316,16 @@ class TestPatroni(unittest.TestCase):
             })],
             **without_members
         )
-        with patch('patroni.dcs.AbstractDCS.get_cluster', Mock(return_value=bad_cluster)):
-            # If the api of the running node cannot be reached, this implies unique name
-            with patch('urllib3.PoolManager.request', Mock(side_effect=ConnectionError)):
-                self.assertIsNone(self.p.ensure_unique_name())
-            # Only if the api of the running node is reachable do we throw an error
-            with patch('urllib3.PoolManager.request', Mock()):
-                self.assertRaises(SystemExit, self.p.ensure_unique_name)
+        # If the api of the running node cannot be reached, this implies unique name
+        with patch('urllib3.PoolManager.request', Mock(side_effect=ConnectionError)):
+            self.assertIsNone(self.p.ensure_unique_name(bad_cluster))
+        # Only if the api of the running node is reachable do we throw an error
+        with patch('urllib3.PoolManager.request', Mock()):
+            self.assertRaises(SystemExit, self.p.ensure_unique_name, bad_cluster)
+
+    @patch('patroni.dcs.AbstractDCS.get_cluster', Mock(side_effect=[DCSError('foo'), DCSError('foo'), None]))
+    def test_ensure_dcs_access(self):
+        with patch('patroni.__main__.logger.warning') as mock_logger:
+            result = self.p.ensure_dcs_access()
+            self.assertEqual(result, None)
+            self.assertEqual(mock_logger.call_count, 2)

@@ -2,7 +2,8 @@ import datetime
 import os
 import shutil
 import unittest
-from unittest.mock import Mock, PropertyMock, patch
+
+from unittest.mock import Mock, patch, PropertyMock
 
 import urllib3
 
@@ -11,6 +12,7 @@ import patroni.psycopg as psycopg
 from patroni.dcs import Leader, Member
 from patroni.postgresql import Postgresql
 from patroni.postgresql.config import ConfigHandler
+from patroni.postgresql.misc import PostgresqlState
 from patroni.postgresql.mpp import get_mpp
 from patroni.utils import RetryFailedError, tzutc
 
@@ -25,7 +27,7 @@ mock_available_gucs = PropertyMock(return_value={
     'max_wal_senders', 'max_worker_processes', 'port', 'search_path', 'shared_preload_libraries',
     'stats_temp_directory', 'synchronous_standby_names', 'track_commit_timestamp', 'unix_socket_directories',
     'vacuum_cost_delay', 'vacuum_cost_limit', 'wal_keep_size', 'wal_level', 'wal_log_hints', 'zero_damaged_pages',
-    'autovacuum', 'wal_segment_size', 'wal_block_size', 'shared_buffers', 'wal_buffers',
+    'autovacuum', 'wal_segment_size', 'wal_block_size', 'shared_buffers', 'wal_buffers', 'fork_specific_param',
 })
 
 GET_PG_SETTINGS_RESULT = [
@@ -65,7 +67,7 @@ class MockResponse(object):
 
     def __init__(self, status_code=200):
         self.status_code = status_code
-        self.headers = {'content-type': 'json'}
+        self.headers = {'content-type': 'json', 'lsn': 100}
         self.content = '{}'
         self.reason = 'Not Found'
 
@@ -137,13 +139,13 @@ class MockCursor(object):
         elif sql.startswith('SELECT slot_name, slot_type, datname, plugin, catalog_xmin'):
             self.results = [('ls', 'logical', 'a', 'b', 100, 500, b'123456')]
         elif sql.startswith('SELECT slot_name'):
-            self.results = [('blabla', 'physical', 12345),
-                            ('foobar', 'physical', 12345),
-                            ('ls', 'logical', 499, 'b', 'a', 5, 100, 500)]
+            self.results = [('blabla', 'physical', 1, 12345),
+                            ('foobar', 'physical', 1, 12345),
+                            ('ls', 'logical', 1, 499, 'b', 'a', 5, 100, 500)]
         elif sql.startswith('WITH slots AS (SELECT slot_name, active'):
             self.results = [(False, True)] if self.rowcount == 1 else []
         elif sql.startswith('SELECT CASE WHEN pg_catalog.pg_is_in_recovery()'):
-            self.results = [(1, 2, 1, 0, False, 1, 1, None, None, 'streaming', '',
+            self.results = [(1, 2, 1, 0, False, 1, 1, 1, None, None, 'streaming', '',
                              [{"slot_name": "ls", "confirmed_flush_lsn": 12345, "restart_lsn": 12344}],
                              'on', 'n1', None)]
         elif sql.startswith('SELECT pg_catalog.pg_is_in_recovery()'):
@@ -178,8 +180,12 @@ class MockCursor(object):
                                  b'3\t0/403DD98\tno recovery target specified\n')]
         elif sql.startswith('SELECT pg_catalog.citus_add_node'):
             self.results = [(2,)]
-        elif sql.startswith('SELECT nodeid, groupid'):
-            self.results = [(1, 0, 'host1', 5432, 'primary'), (2, 1, 'host2', 5432, 'primary')]
+        elif sql.startswith('SELECT groupid, nodename'):
+            self.results = [(0, 'host1', 5432, 'primary', 1),
+                            (0, '127.0.0.1', 5436, 'secondary', 2),
+                            (1, 'host4', 5432, 'primary', 3),
+                            (1, '127.0.0.1', 5437, 'secondary', 4),
+                            (1, '127.0.0.1', 5438, 'secondary', 5)]
         else:
             self.results = [(None, None, None, None, None, None, None, None, None, None)]
         self.rowcount = len(self.results)
@@ -201,20 +207,16 @@ class MockCursor(object):
         pass
 
 
-class MockConnectionInfo(object):
-
-    def parameter_status(self, param_name):
-        if param_name == 'is_superuser':
-            return 'on'
-        return '0'
-
-
 class MockConnect(object):
 
     server_version = 99999
     autocommit = False
     closed = 0
-    info = MockConnectionInfo()
+
+    def get_parameter_status(self, param_name):
+        if param_name == 'is_superuser':
+            return 'on'
+        return '0'
 
     def cursor(self):
         return MockCursor(self)
@@ -251,7 +253,8 @@ class PostgresInit(unittest.TestCase):
     @patch.object(ConfigHandler, 'replace_pg_ident', Mock())
     @patch.object(Postgresql, 'get_postgres_role_from_data_directory', Mock(return_value='primary'))
     def setUp(self):
-        data_dir = os.path.join('data', 'test0')
+        self._tmp_dir = 'data'
+        data_dir = os.path.join(self._tmp_dir, 'test0')
         config = {'name': 'postgresql0', 'scope': 'batman', 'data_dir': data_dir,
                   'config_dir': data_dir, 'retry_timeout': 10,
                   'krbsrvname': 'postgres', 'pgpass': os.path.join(data_dir, 'pgpass0'),
@@ -281,14 +284,17 @@ class BaseTestPostgresql(PostgresInit):
         if not os.path.exists(self.p.data_dir):
             os.makedirs(self.p.data_dir)
 
-        self.leadermem = Member(0, 'leader', 28, {'xlog_location': 100, 'state': 'running',
+        self.leadermem = Member(0, 'leader', 28, {'xlog_location': 100, 'state': PostgresqlState.RUNNING,
                                                   'conn_url': 'postgres://replicator:rep-pass@127.0.0.1:5435/postgres'})
         self.leader = Leader(-1, 28, self.leadermem)
         self.other = Member(0, 'test-1', 28, {'conn_url': 'postgres://replicator:rep-pass@127.0.0.1:5433/postgres',
-                                              'state': 'running', 'tags': {'replicatefrom': 'leader'}})
+                                              'state': PostgresqlState.RUNNING, 'tags': {'replicatefrom': 'leader'}})
         self.me = Member(0, 'test0', 28, {
-            'state': 'running', 'conn_url': 'postgres://replicator:rep-pass@127.0.0.1:5434/postgres'})
+            'state': PostgresqlState.RUNNING, 'conn_url': 'postgres://replicator:rep-pass@127.0.0.1:5434/postgres'})
 
     def tearDown(self):
         if os.path.exists(self.p.data_dir):
             shutil.rmtree(self.p.data_dir)
+
+        if not os.listdir(self._tmp_dir):
+            shutil.rmtree(self._tmp_dir)

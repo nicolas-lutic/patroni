@@ -78,7 +78,7 @@ This is the synopsis for running a command from the ``patronictl``:
     - Things written in uppercase represent a literal that should be given a value to.
 
     We will use this same syntax when describing ``patronictl`` sub-commands in the following sub-sections.
-    Also, when describing sub-commands in the following sub-sections, the commands' synposis should be seen as a replacement for the ``SUBCOMMAND`` in the above synopsis.
+    Also, when describing sub-commands in the following sub-sections, the commands' synopsis should be seen as a replacement for the ``SUBCOMMAND`` in the above synopsis.
 
 In the following sub-sections you can find a description of each command implemented by ``patronictl``. For sake of example, we will use the configuration files present in the GitHub repository of Patroni (files ``postgres0.yml``, ``postgres1.yml`` and ``postgres2.yml``).
 
@@ -224,7 +224,7 @@ Parameters
 
     ``PG_CONFIG`` is the name of the Postgres configuration to be set.
 
-    ``PG_VALUE`` is the value for ``PG_CONFIG``. If it is ``nulll``, then ``PG_CONFIG`` will be removed from the dynamic configuration.
+    ``PG_VALUE`` is the value for ``PG_CONFIG``. If it is ``null``, then ``PG_CONFIG`` will be removed from the dynamic configuration.
 
 ``--apply``
     Apply dynamic configuration from the given file.
@@ -320,7 +320,6 @@ Synopsis
     failover
       [ CLUSTER_NAME ]
       [ --group CITUS_GROUP ]
-      [ { --leader | --primary } LEADER_NAME ]
       --candidate CANDIDATE_NAME
       [ --force ]
 
@@ -358,16 +357,6 @@ Parameters
     Perform a failover in the given Citus group.
 
     ``CITUS_GROUP`` is the ID of the Citus group.
-
-``--leader`` / ``--primary``
-    Indicate who is the expected leader at failover time.
-
-    If given, a switchover is performed instead of a failover.
-
-    ``LEADER_NAME`` should match the name of the current leader in the cluster.
-
-    .. warning::
-        This argument is deprecated and will be removed in a future release.
 
 ``--candidate``
     The node to be promoted on failover.
@@ -1438,7 +1427,7 @@ Parameters
 ``--scheduled``
     Schedule a restart to occur at the given timestamp.
 
-    ``TIMESTAMP`` is the timestamp when the restart should occur. Specify it in unambiguous format, preferrably with time zone. You can also use the literal ``now`` for the restart to be executed immediately.
+    ``TIMESTAMP`` is the timestamp when the restart should occur. Specify it in unambiguous format, preferably with time zone. You can also use the literal ``now`` for the restart to be executed immediately.
 
 ``--force``
     Flag to skip confirmation prompts when requesting the restart operations.
@@ -1676,7 +1665,7 @@ Parameters
 ``--scheduled``
     Schedule a switchover to occur at the given timestamp.
 
-    ``TIMESTAMP`` is the timestamp when the switchover should occur. Specify it in unambiguous format, preferrably with time zone. You can also use the literal ``now`` for the switchover to be executed immediately.
+    ``TIMESTAMP`` is the timestamp when the switchover should occur. Specify it in unambiguous format, preferably with time zone. You can also use the literal ``now`` for the switchover to be executed immediately.
 
 ``--force``
     Flag to skip confirmation prompts when performing the switchover.
@@ -1951,25 +1940,25 @@ Get version of ``patronictl`` only:
 .. code:: bash
 
     $ patronictl -c postgres0.yml version
-    patronictl version 3.1.0
+    patronictl version 4.0.0
 
 Get version of ``patronictl`` and of all members of cluster ``batman``:
 
 .. code:: bash
 
     $ patronictl -c postgres0.yml version batman
-    patronictl version 3.1.0
+    patronictl version 4.0.0
 
-    postgresql0: Patroni 3.1.0 PostgreSQL 15.2
-    postgresql1: Patroni 3.1.0 PostgreSQL 15.2
-    postgresql2: Patroni 3.1.0 PostgreSQL 15.2
+    postgresql0: Patroni 4.0.0 PostgreSQL 16.4
+    postgresql1: Patroni 4.0.0 PostgreSQL 16.4
+    postgresql2: Patroni 4.0.0 PostgreSQL 16.4
 
 Get version of ``patronictl`` and of members ``postgresql1`` and ``postgresql2`` of cluster ``batman``:
 
 .. code:: bash
 
     $ patronictl -c postgres0.yml version batman postgresql1 postgresql2
-    patronictl version 3.1.0
+    patronictl version 4.0.0
 
-    postgresql1: Patroni 3.1.0 PostgreSQL 15.2
-    postgresql2: Patroni 3.1.0 PostgreSQL 15.2
+    postgresql1: Patroni 4.0.0 PostgreSQL 16.4
+    postgresql2: Patroni 4.0.0 PostgreSQL 16.4

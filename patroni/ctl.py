@@ -12,12 +12,9 @@
     If it is also missing in the configuration file we assume that this is just a normal Patroni cluster (not Citus).
 """
 
-import click
 import codecs
 import copy
 import datetime
-import dateutil.parser
-import dateutil.tz
 import difflib
 import io
 import json
@@ -28,15 +25,28 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import urllib3
 import time
-import yaml
 
 from collections import defaultdict
 from contextlib import contextmanager
-from prettytable import ALL, FRAME, PrettyTable
+from typing import Any, Dict, Iterator, List, Optional, Tuple, TYPE_CHECKING, Union
 from urllib.parse import urlparse
-from typing import Any, Dict, Iterator, List, Optional, Union, Tuple, TYPE_CHECKING
+
+import click
+import dateutil.parser
+import dateutil.tz
+import urllib3
+import yaml
+
+from prettytable import PrettyTable
+
+try:  # pragma: no cover
+    from prettytable import HRuleStyle
+    hrule_all = HRuleStyle.ALL
+    hrule_frame = HRuleStyle.FRAME
+except ImportError:  # pragma: no cover
+    from prettytable import ALL as hrule_all, FRAME as hrule_frame
+
 if TYPE_CHECKING:  # pragma: no cover
     from psycopg import Cursor
     from psycopg2 import cursor
@@ -52,12 +62,12 @@ except ImportError:  # pragma: no cover
 
 from . import global_config
 from .config import Config
-from .dcs import get_dcs as _get_dcs, AbstractDCS, Cluster, Member
+from .dcs import AbstractDCS, Cluster, get_dcs as _get_dcs, Member
 from .exceptions import PatroniException
-from .postgresql.misc import postgres_version_to_int
+from .postgresql.misc import postgres_version_to_int, PostgresqlState
 from .postgresql.mpp import get_mpp
-from .utils import cluster_as_json, patch_config, polling_loop
 from .request import PatroniRequest
+from .utils import cluster_as_json, patch_config, polling_loop
 from .version import __version__
 
 CONFIG_DIR_PATH = click.get_app_dir('patroni')
@@ -279,7 +289,7 @@ arg_cluster_name = click.argument('cluster_name', required=False,
 option_default_citus_group = click.option('--group', required=False, type=int, help='Citus group',
                                           default=lambda: _get_configuration().get('citus', {}).get('group'))
 option_citus_group = click.option('--group', required=False, type=int, help='Citus group')
-role_choice = click.Choice(['leader', 'primary', 'standby-leader', 'replica', 'standby', 'any', 'master'])
+role_choice = click.Choice(['leader', 'primary', 'standby-leader', 'replica', 'standby', 'any'])
 
 
 @click.group(cls=click.Group)
@@ -298,7 +308,7 @@ def ctl(ctx: click.Context, config_file: str, dcs_url: Optional[str], insecure: 
     .. note::
         Besides *dcs_url* and *insecure*, which are used to override DCS configuration section and ``ctl.insecure``
         setting, you can also override the value of ``log.level``, by default ``WARNING``, through either of these
-        environemnt variables:
+        environment variables:
             * ``LOGLEVEL``
             * ``PATRONI_LOGLEVEL``
             * ``PATRONI_LOG_LEVEL``
@@ -307,7 +317,7 @@ def ctl(ctx: click.Context, config_file: str, dcs_url: Optional[str], insecure: 
     :param config_file: path to the configuration file.
     :param dcs_url: the DCS URL in the format ``DCS://HOST:PORT``, e.g. ``etcd3://random.com:2399``. If given override
         whatever DCS is set in the configuration file.
-    :param insecure: if ``True`` allow SSL connections without client certiticates. Override what is configured through
+    :param insecure: if ``True`` allow SSL connections without client certificates. Override what is configured through
         ``ctl.insecure` in the configuration file.
     """
     level = 'WARNING'
@@ -329,6 +339,10 @@ def is_citus_cluster() -> bool:
     return click.get_current_context().obj['__mpp'].is_enabled()
 
 
+# Cache DCS instances for given scope and group
+__dcs_cache: Dict[Tuple[str, Optional[int]], AbstractDCS] = {}
+
+
 def get_dcs(scope: str, group: Optional[int]) -> AbstractDCS:
     """Get the DCS object.
 
@@ -342,6 +356,8 @@ def get_dcs(scope: str, group: Optional[int]) -> AbstractDCS:
     :raises:
         :class:`PatroniCtlException`: if not suitable DCS configuration could be found.
     """
+    if (scope, group) in __dcs_cache:
+        return __dcs_cache[(scope, group)]
     config = _get_configuration()
     config.update({'scope': scope, 'patronictl': True})
     if group is not None:
@@ -352,6 +368,7 @@ def get_dcs(scope: str, group: Optional[int]) -> AbstractDCS:
         if is_citus_cluster() and group is None:
             dcs.is_mpp_coordinator = lambda: True
         click.get_current_context().obj['__mpp'] = dcs.mpp
+        __dcs_cache[(scope, group)] = dcs
         return dcs
     except PatroniException as e:
         raise PatroniCtlException(str(e))
@@ -427,7 +444,7 @@ def print_output(columns: Optional[List[str]], rows: List[List[Any]], alignment:
         else:
             # If any value is multi-line, then add horizontal between all table rows while printing to get a clear
             # visual separation of rows.
-            hrules = ALL if any(any(isinstance(c, str) and '\n' in c for c in r) for r in rows) else FRAME
+            hrules = hrule_all if any(any(isinstance(c, str) and '\n' in c for c in r) for r in rows) else hrule_frame
             table = PatronictlPrettyTable(header, columns, hrules=hrules)
             table.align = 'l'
             for k, v in (alignment or {}).items():
@@ -483,7 +500,7 @@ def get_all_members(cluster: Cluster, group: Optional[int], role: str = 'leader'
     :param group: filter which Citus group we should get members from. If ``None`` get from all groups.
     :param role: role to filter members. Can be one among:
 
-        * ``primary`` or ``master``: the primary PostgreSQL instance;
+        * ``primary``: the primary PostgreSQL instance;
         * ``replica`` or ``standby``: a standby PostgreSQL instance;
         * ``leader``: the leader of a Patroni cluster. Can also be used to get the leader of a Patroni standby cluster;
         * ``standby-leader``: the leader of a Patroni standby cluster;
@@ -494,16 +511,15 @@ def get_all_members(cluster: Cluster, group: Optional[int], role: str = 'leader'
     clusters = {0: cluster}
     if is_citus_cluster() and group is None:
         clusters.update(cluster.workers)
-    if role in ('leader', 'master', 'primary', 'standby-leader'):
+    if role in ('leader', 'primary', 'standby-leader'):
         # In the DCS the members' role can be one among: ``primary``, ``master``, ``replica`` or ``standby_leader``.
-        # ``primary`` and ``master`` are the same thing, so we map both to ``master`` to have a simpler ``if``.
-        # In a future release we might remove ``master`` from the available roles for the DCS members.
-        role = {'primary': 'master', 'standby-leader': 'standby_leader'}.get(role, role)
+        # ``primary`` and ``master`` are the same thing.
+        role = {'standby-leader': 'standby_leader'}.get(role, role)
         for cluster in clusters.values():
             if cluster.leader is not None and cluster.leader.name and\
                     (role == 'leader'
-                     or cluster.leader.data.get('role') != 'master' and role == 'standby_leader'
-                     or cluster.leader.data.get('role') != 'standby_leader' and role == 'master'):
+                     or cluster.leader.data.get('role') not in ('primary', 'master') and role == 'standby_leader'
+                     or cluster.leader.data.get('role') != 'standby_leader' and role == 'primary'):
                 yield cluster.leader.member
         return
 
@@ -605,8 +621,7 @@ def get_cursor(cluster: Cluster, group: Optional[int], connect_parameters: Dict[
     row = cursor.fetchone()
     in_recovery = not row or row[0]
 
-    if in_recovery and role in ('replica', 'standby', 'standby-leader')\
-            or not in_recovery and role in ('master', 'primary'):
+    if in_recovery and role in ('replica', 'standby', 'standby-leader') or not in_recovery and role == 'primary':
         return cursor
 
     conn.close()
@@ -696,7 +711,7 @@ def get_members(cluster: Cluster, cluster_name: str, member_names: List[str], ro
 
 
 def confirm_members_action(members: List[Member], force: bool, action: str,
-                           scheduled_at: Optional[datetime.datetime] = None) -> None:
+                           scheduled_at: Optional[datetime.datetime] = None, pending: Optional[bool] = None) -> None:
     """Ask for confirmation if *action* should be taken by *members*.
 
     :param members: list of member which will take the *action*.
@@ -715,8 +730,13 @@ def confirm_members_action(members: List[Member], force: bool, action: str,
     """
     if scheduled_at:
         if not force:
-            confirm = click.confirm('Are you sure you want to schedule {0} of members {1} at {2}?'
-                                    .format(action, ', '.join([m.name for m in members]), scheduled_at))
+            if pending:
+                confirm = click.confirm('The nodes needing a restart will be identified at the scheduled time, and '
+                                        'might be different from the ones showing pending restart right now. '
+                                        'Is this fine?')
+            else:
+                confirm = click.confirm('Are you sure you want to schedule {0} of members {1} at {2}?'
+                                        .format(action, ', '.join([m.name for m in members]), scheduled_at))
             if not confirm:
                 raise PatroniCtlException('Aborted scheduled {0}'.format(action))
     else:
@@ -957,7 +977,7 @@ def check_response(response: urllib3.response.HTTPResponse, member_name: str,
     :param action_name: action associated with the *response*.
     :param silent_success: if a status message should be skipped upon a successful *response*.
 
-    :returns: ``True`` if the response indicates a sucessful operation (HTTP status < ``400``), ``False`` otherwise.
+    :returns: ``True`` if the response indicates a successful operation (HTTP status < ``400``), ``False`` otherwise.
     """
     if response.status >= 400:
         click.echo('Failed: {0} for member {1}, status code={2}, ({3})'.format(
@@ -1089,19 +1109,24 @@ def restart(cluster_name: str, group: Optional[int], member_names: List[str],
                                  type=str, default='now')
 
     scheduled_at = parse_scheduled(scheduled)
-    confirm_members_action(members, force, 'restart', scheduled_at)
+
+    content: Dict[str, Any] = {}
+    if pending:
+        content['restart_pending'] = True
+        # For scheduled restarts we don't filter the members now. If they really need a restart might change
+        # until the scheduled time.
+        if not scheduled_at:
+            members = [m for m in members if m.data.get('pending_restart', False)]
 
     if p_any:
         random.shuffle(members)
         members = members[:1]
 
+    confirm_members_action(members, force, 'restart', scheduled_at, pending)
+
     if version is None and not force:
         version = click.prompt('Restart if the PostgreSQL version is less than provided (e.g. 9.5.2) ',
                                type=str, default='')
-
-    content: Dict[str, Any] = {}
-    if pending:
-        content['restart_pending'] = True
 
     if version:
         try:
@@ -1185,14 +1210,14 @@ def reinit(cluster_name: str, group: Optional[int], member_names: List[str], for
         time.sleep(2)
         for member in wait_on_members:
             data = json.loads(request_patroni(member, 'get', 'patroni').data.decode('utf-8'))
-            if data.get('state') != 'creating replica':
+            if data.get('state') != PostgresqlState.CREATING_REPLICA:
                 click.echo('Reinitialize is completed on: {0}'.format(member.name))
                 wait_on_members.remove(member)
 
 
-def _do_failover_or_switchover(action: str, cluster_name: str, group: Optional[int],
-                               switchover_leader: Optional[str], candidate: Optional[str],
-                               force: bool, scheduled: Optional[str] = None) -> None:
+def _do_failover_or_switchover(action: str, cluster_name: str, group: Optional[int], candidate: Optional[str],
+                               force: bool, switchover_leader: Optional[str] = None,
+                               switchover_scheduled: Optional[str] = None) -> None:
     """Perform a failover or a switchover operation in the cluster.
 
     Informational messages are printed in the console during the operation, as well as the list of members before and
@@ -1205,10 +1230,11 @@ def _do_failover_or_switchover(action: str, cluster_name: str, group: Optional[i
     :param cluster_name: name of the Patroni cluster.
     :param group: filter Citus group within we should perform a failover or switchover. If ``None``, user will be
         prompted for filling it -- unless *force* is ``True``, in which case an exception is raised.
-    :param switchover_leader: name of the leader member passed as switchover option.
     :param candidate: name of a standby member to be promoted. Nodes that are tagged with ``nofailover`` cannot be used.
     :param force: perform the failover or switchover without asking for confirmations.
-    :param scheduled: timestamp when the switchover should be scheduled to occur. If ``now`` perform immediately.
+    :param switchover_leader: name of the leader passed to the switchover command if any.
+    :param switchover_scheduled: timestamp when the switchover should be scheduled to occur. If ``now``,
+        perform immediately.
 
     :raises:
         :class:`PatroniCtlException`: if:
@@ -1287,12 +1313,12 @@ def _do_failover_or_switchover(action: str, cluster_name: str, group: Optional[i
     scheduled_at = None
 
     if action == 'switchover':
-        if scheduled is None and not force:
+        if switchover_scheduled is None and not force:
             next_hour = (datetime.datetime.now() + datetime.timedelta(hours=1)).strftime('%Y-%m-%dT%H:%M')
-            scheduled = click.prompt('When should the switchover take place (e.g. ' + next_hour + ' ) ',
-                                     type=str, default='now')
+            switchover_scheduled = click.prompt('When should the switchover take place (e.g. ' + next_hour + ' ) ',
+                                                type=str, default='now')
 
-        scheduled_at = parse_scheduled(scheduled)
+        scheduled_at = parse_scheduled(switchover_scheduled)
         if scheduled_at:
             if config.is_paused:
                 raise PatroniCtlException("Can't schedule switchover in the paused state")
@@ -1350,20 +1376,12 @@ def _do_failover_or_switchover(action: str, cluster_name: str, group: Optional[i
 @ctl.command('failover', help='Failover to a replica')
 @arg_cluster_name
 @option_citus_group
-@click.option('--leader', '--primary', '--master', 'leader', help='The name of the current leader', default=None)
 @click.option('--candidate', help='The name of the candidate', default=None)
 @option_force
-def failover(cluster_name: str, group: Optional[int],
-             leader: Optional[str], candidate: Optional[str], force: bool) -> None:
+def failover(cluster_name: str, group: Optional[int], candidate: Optional[str], force: bool) -> None:
     """Process ``failover`` command of ``patronictl`` utility.
 
     Perform a failover operation immediately in the cluster.
-
-    .. note::
-        If *leader* is given perform a switchover instead of a failover.
-        This behavior is deprecated. ``--leader`` option support will be
-        removed in the next major release.
-
     .. seealso::
         Refer to :func:`_do_failover_or_switchover` for details.
 
@@ -1371,23 +1389,16 @@ def failover(cluster_name: str, group: Optional[int],
     :param group: filter Citus group within we should perform a failover or switchover. If ``None``, user will be
         prompted for filling it -- unless *force* is ``True``, in which case an exception is raised by
         :func:`_do_failover_or_switchover`.
-    :param leader: name of the current leader member.
     :param candidate: name of a standby member to be promoted. Nodes that are tagged with ``nofailover`` cannot be used.
     :param force: perform the failover or switchover without asking for confirmations.
     """
-    action = 'failover'
-    if leader:
-        action = 'switchover'
-        click.echo(click.style(
-            'Supplying a leader name using this command is deprecated and will be removed in a future version of'
-            ' Patroni, change your scripts to use `switchover` instead.\nExecuting switchover!', fg='red'))
-    _do_failover_or_switchover(action, cluster_name, group, leader, candidate, force)
+    _do_failover_or_switchover('failover', cluster_name, group, candidate, force)
 
 
 @ctl.command('switchover', help='Switchover to a replica')
 @arg_cluster_name
 @option_citus_group
-@click.option('--leader', '--primary', '--master', 'leader', help='The name of the current leader', default=None)
+@click.option('--leader', '--primary', 'leader', help='The name of the current leader', default=None)
 @click.option('--candidate', help='The name of the candidate', default=None)
 @click.option('--scheduled', help='Timestamp of a scheduled switchover in unambiguous format (e.g. ISO 8601)',
               default=None)
@@ -1410,7 +1421,7 @@ def switchover(cluster_name: str, group: Optional[int], leader: Optional[str],
     :param force: perform the switchover without asking for confirmations.
     :param scheduled: timestamp when the switchover should be scheduled to occur. If ``now`` perform immediately.
     """
-    _do_failover_or_switchover('switchover', cluster_name, group, leader, candidate, force, scheduled)
+    _do_failover_or_switchover('switchover', cluster_name, group, candidate, force, leader, scheduled)
 
 
 def generate_topology(level: int, member: Dict[str, Any],
@@ -1435,7 +1446,7 @@ def generate_topology(level: int, member: Dict[str, Any],
               + postgresql2
 
     :param level: the current level being inspected in the *topology*.
-    :param member: information about the current member being inspected in *level* of *topology*. Should countain at
+    :param member: information about the current member being inspected in *level* of *topology*. Should contain at
         least this key:
         * ``name``: name of the node, according to ``name`` configuration;
 
@@ -1462,7 +1473,7 @@ def generate_topology(level: int, member: Dict[str, Any],
 def topology_sort(members: List[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
     """Sort *members* according to their level in the replication topology tree.
 
-    :param members: list of members in the cluster. Each item should countain at least these keys:
+    :param members: list of members in the cluster. Each item should contain at least these keys:
 
         * ``name``: name of the node, according to ``name`` configuration;
         * ``role``: ``leader``, ``standby_leader`` or ``replica``.
@@ -1522,10 +1533,7 @@ def output_members(cluster: Cluster, name: str, extended: bool = False,
         * ``Member``: name of the Patroni node, as per ``name`` configuration;
         * ``Host``: hostname (or IP) and port, as per ``postgresql.listen`` configuration;
         * ``Role``: ``Leader``, ``Standby Leader``, ``Sync Standby`` or ``Replica``;
-        * ``State``: ``stopping``, ``stopped``, ``stop failed``, ``crashed``, ``running``, ``starting``,
-          ``start failed``, ``restarting``, ``restart failed``, ``initializing new cluster``, ``initdb failed``,
-          ``running custom bootstrap script``, ``custom bootstrap failed``, ``creating replica``, ``streaming``,
-          ``in archive recovery``, and so on;
+        * ``State``: one of :class:`~patroni.postgresql.misc.PostgresqlState`;
         * ``TL``: current timeline in Postgres;
           ``Lag in MB``: replication lag.
 
@@ -1895,12 +1903,13 @@ def show_diff(before_editing: str, after_editing: str) -> None:
     unified_diff = difflib.unified_diff(listify(before_editing), listify(after_editing))
 
     if sys.stdout.isatty():
-        buf = io.StringIO()
+        buf = io.BytesIO()
         for line in unified_diff:
-            buf.write(str(line))
+            buf.write(line.encode('utf-8'))
         buf.seek(0)
 
         class opts:
+            theme = 'default'
             side_by_side = False
             width = 80
             tab_width = 8
@@ -2029,7 +2038,7 @@ def invoke_editor(before_editing: str, cluster_name: str) -> Tuple[str, Dict[str
 
     .. note::
         Requires an editor program, and uses first found among:
-            * Program given by ``EDITOR`` environemnt variable; or
+            * Program given by ``EDITOR`` environment variable; or
             * ``editor``; or
             * ``vi``.
 
@@ -2053,9 +2062,10 @@ def invoke_editor(before_editing: str, cluster_name: str) -> Tuple[str, Dict[str
     if not editor_cmd:
         raise PatroniCtlException('EDITOR environment variable is not set. editor or vi are not available')
 
+    safe_cluster_name = cluster_name.replace("/", "_")
     with temporary_file(contents=before_editing.encode('utf-8'),
                         suffix='.yaml',
-                        prefix='{0}-config-'.format(cluster_name)) as tmpfile:
+                        prefix='{0}-config-'.format(safe_cluster_name)) as tmpfile:
         ret = subprocess.call([editor_cmd, tmpfile])
         if ret:
             raise PatroniCtlException("Editor exited with return code {0}".format(ret))

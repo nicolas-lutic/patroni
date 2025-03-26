@@ -1,14 +1,16 @@
 import os
-import unittest
 import tempfile
 import time
-from unittest.mock import Mock, PropertyMock, patch
+import unittest
+
+from unittest.mock import Mock, patch, PropertyMock
+
+from pysyncobj import FAIL_REASON, SyncObjConf
 
 from patroni.dcs import get_dcs
-from patroni.dcs.raft import Cluster, DynMemberSyncObj, KVStoreTTL, \
-    Raft, RaftError, SyncObjUtility, TCPTransport, _TCPTransport
+from patroni.dcs.raft import _TCPTransport, Cluster, DynMemberSyncObj, \
+    KVStoreTTL, Raft, RaftError, SyncObjUtility, TCPTransport
 from patroni.postgresql.mpp import get_mpp
-from pysyncobj import SyncObjConf, FAIL_REASON
 
 
 def remove_files(prefix):
@@ -140,8 +142,8 @@ class TestRaft(unittest.TestCase):
         self.assertTrue(raft.initialize())
         self.assertTrue(raft.cancel_initialization())
         self.assertTrue(raft.set_config_value('{}'))
-        self.assertTrue(raft.write_sync_state('foo', 'bar'))
-        self.assertFalse(raft.write_sync_state('foo', 'bar', 1))
+        self.assertTrue(raft.write_sync_state('foo', 'bar', 0))
+        self.assertFalse(raft.write_sync_state('foo', 'bar', 0, 1))
         raft._mpp = get_mpp({'citus': {'group': 1, 'database': 'postgres'}})
         self.assertTrue(raft.manual_failover('foo', 'bar'))
         raft._mpp = get_mpp({'citus': {'group': 0, 'database': 'postgres'}})
@@ -149,11 +151,11 @@ class TestRaft(unittest.TestCase):
         cluster = raft.get_cluster()
         self.assertIsInstance(cluster, Cluster)
         self.assertIsInstance(cluster.workers[1], Cluster)
-        leader = cluster.leader
-        self.assertTrue(raft.delete_leader(leader))
-        self.assertTrue(raft._sync_obj.set(raft.status_path, '{"optime":1234567,"slots":{"ls":12345}}'))
+        self.assertTrue(raft.delete_leader(cluster.leader))
+        self.assertTrue(raft._sync_obj.set(raft.status_path,
+                                           '{"optime":1234567,"slots":{"ls":12345},"retain_slots":["postgresql0"]}'))
         raft.get_cluster()
-        self.assertTrue(raft.update_leader(leader, '1', failsafe={'foo': 'bat'}))
+        self.assertTrue(raft.update_leader(cluster, '1', failsafe={'foo': 'bat'}))
         self.assertTrue(raft._sync_obj.set(raft.failsafe_path, '{"foo"}'))
         self.assertTrue(raft._sync_obj.set(raft.status_path, '{'))
         raft.get_mpp_coordinator()

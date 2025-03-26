@@ -2,18 +2,24 @@ import logging
 import os
 import sys
 import unittest
-import yaml
+
 from io import StringIO
-from queue import Queue, Full
+from queue import Full, Queue
 from unittest.mock import Mock, patch
+
+import yaml
 
 from patroni.config import Config
 from patroni.log import PatroniLogger
 
 try:
-    from pythonjsonlogger import jsonlogger
+    try:
+        from pythonjsonlogger import json as jsonlogger
+    except ImportError:
+        from pythonjsonlogger import jsonlogger
 
-    jsonlogger.JsonFormatter(None, None, rename_fields={}, static_fields={})
+        jsonlogger.JsonFormatter(None, None, rename_fields={}, static_fields={})
+
     json_formatter_is_available = True
 
     import json  # we need json.loads() function
@@ -38,6 +44,7 @@ class TestPatroniLogger(unittest.TestCase):
                 'traceback_level': 'DEBUG',
                 'max_queue_size': 5,
                 'dir': 'foo',
+                'mode': 0o600,
                 'file_size': 4096,
                 'file_num': 5,
                 'loggers': {
@@ -50,7 +57,9 @@ class TestPatroniLogger(unittest.TestCase):
         os.environ[Config.PATRONI_CONFIG_VARIABLE] = yaml.dump(config, default_flow_style=False)
         logger = PatroniLogger()
         patroni_config = Config(None)
-        logger.reload_config(patroni_config['log'])
+        with patch('os.chmod') as mock_chmod:
+            logger.reload_config(patroni_config['log'])
+            self.assertEqual(mock_chmod.call_args[0][1], 0o600)
         _LOG.exception('test')
         logger.start()
 
@@ -74,6 +83,8 @@ class TestPatroniLogger(unittest.TestCase):
             self.assertRaises(Exception, logger.shutdown)
         self.assertLessEqual(logger.queue_size, 2)  # "Failed to close the old log handler" could be still in the queue
         self.assertEqual(logger.records_lost, 0)
+        del config['log']['traceback_level']
+        logger.reload_config(config)
 
     def test_interceptor(self):
         logger = PatroniLogger()
@@ -81,6 +92,17 @@ class TestPatroniLogger(unittest.TestCase):
         logger.start()
         _LOG.info('Lock owner: ')
         _LOG.info('blabla')
+        logger.shutdown()
+        self.assertEqual(logger.records_lost, 0)
+
+    def test_deduplicate_heartbeat_logs(self):
+        logger = PatroniLogger()
+        logger.reload_config({'level': 'INFO', 'deduplicate_heartbeat_logs': True})
+        logger.start()
+        _LOG.info('Lock owner: ')
+        _LOG.info('no action. I am (patroni2), a secondary, and following a leader (patroni3)')
+        _LOG.info('Lock owner: ')
+        _LOG.info('no action. I am (patroni2), a secondary, and following a leader (patroni3)')
         logger.shutdown()
         self.assertEqual(logger.records_lost, 0)
 
@@ -269,6 +291,7 @@ class TestPatroniLogger(unittest.TestCase):
         with self.assertLogs() as captured_log:
             logger = PatroniLogger()
             pythonjsonlogger = Mock()
+            pythonjsonlogger.json.JsonFormatter = Mock(side_effect=Exception)
             pythonjsonlogger.jsonlogger.JsonFormatter = Mock(side_effect=Exception)
             with patch('builtins.__import__', Mock(return_value=pythonjsonlogger)):
                 logger.reload_config({'type': 'json'})

@@ -1,19 +1,19 @@
 import os
-import psutil
 import unittest
-import yaml
 
-from . import MockConnect, MockCursor, MockConnectionInfo
 from copy import deepcopy
-from unittest.mock import MagicMock, Mock, PropertyMock, mock_open as _mock_open, patch
+from unittest.mock import MagicMock, Mock, mock_open as _mock_open, patch, PropertyMock
+
+import psutil
+import yaml
 
 from patroni.__main__ import main as _main
 from patroni.config import Config
 from patroni.config_generator import AbstractConfigGenerator, get_address, NO_VALUE_MSG
 from patroni.log import PatroniLogger
-from patroni.utils import patch_config, parse_bool
+from patroni.utils import parse_bool, patch_config
 
-from . import psycopg_connect
+from . import MockConnect, MockCursor, psycopg_connect
 
 HOSTNAME = 'test_hostname'
 IP = '1.9.8.4'
@@ -29,7 +29,7 @@ def mock_open(*args, **kwargs):
 
 @patch('patroni.psycopg.connect', psycopg_connect)
 @patch('builtins.open', MagicMock())
-@patch('subprocess.check_output', Mock(return_value=b"postgres (PostgreSQL) 16.2"))
+@patch('subprocess.check_output', Mock(return_value=b"postgres (PostgreSQL) 17.0"))
 @patch('psutil.Process.exe', Mock(return_value='/bin/dir/from/running/postgres'))
 @patch('psutil.Process.__init__', Mock(return_value=None))
 @patch('patroni.config_generator.get_address', Mock(return_value=(HOSTNAME, IP)))
@@ -128,7 +128,8 @@ class TestGenerateConfig(unittest.TestCase):
                         'password': 'qwerty',
                         'channel_binding': 'prefer',
                         'gssencmode': 'prefer',
-                        'sslmode': 'prefer'
+                        'sslmode': 'prefer',
+                        'sslnegotiation': 'postgres'
                     },
                     'replication': {
                         'username': NO_VALUE_MSG,
@@ -139,6 +140,7 @@ class TestGenerateConfig(unittest.TestCase):
             },
             'tags': {
                 'failover_priority': 1,
+                'sync_priority': 1,
                 'noloadbalance': False,
                 'clonefrom': True,
                 'nosync': False,
@@ -177,7 +179,7 @@ class TestGenerateConfig(unittest.TestCase):
                                              '--version'])
 
     @patch('os.makedirs', Mock())
-    def test_generate_sample_config_16(self):
+    def test_generate_sample_config_17(self):
         conf = {
             'bootstrap': {
                 'dcs': {
@@ -213,7 +215,7 @@ class TestGenerateConfig(unittest.TestCase):
 
     @patch('os.makedirs', Mock())
     @patch('sys.stdout')
-    def test_generate_config_running_instance_16(self, mock_sys_stdout):
+    def test_generate_config_running_instance_17(self, mock_sys_stdout):
         self._set_running_instance_config_vals()
 
         with patch('builtins.open', Mock(side_effect=self._get_running_instance_open_res())), \
@@ -226,11 +228,13 @@ class TestGenerateConfig(unittest.TestCase):
 
     @patch('os.makedirs', Mock())
     @patch('sys.stdout')
-    def test_generate_config_running_instance_16_connect_from_env(self, mock_sys_stdout):
+    def test_generate_config_running_instance_17_connect_from_env(self, mock_sys_stdout):
         self._set_running_instance_config_vals()
         # su auth params and connect host from env
         os.environ['PGCHANNELBINDING'] = \
             self.config['postgresql']['authentication']['superuser']['channel_binding'] = 'disable'
+        os.environ['PGSSLNEGOTIATION'] = \
+            self.config['postgresql']['authentication']['superuser']['sslnegotiation'] = 'direct'
 
         conf = {
             'scope': 'my_cluster',
@@ -265,7 +269,7 @@ class TestGenerateConfig(unittest.TestCase):
 
         with patch('builtins.open', Mock(side_effect=self._get_running_instance_open_res())), \
              patch('sys.argv', ['patroni.py', '--generate-config']), \
-             patch.object(MockConnect, 'server_version', PropertyMock(return_value=160000)), \
+             patch.object(MockConnect, 'server_version', PropertyMock(return_value=170000)), \
              self.assertRaises(SystemExit) as e:
             _main()
         self.assertEqual(e.exception.code, 0)
@@ -282,7 +286,7 @@ class TestGenerateConfig(unittest.TestCase):
         with patch('sys.argv', ['patroni.py',
                                 '--generate-config', '--dsn', 'host=foo port=bar user=foobar password=pwd_from_dsn']), \
              patch.object(MockCursor, 'rowcount', PropertyMock(return_value=0), create=True), \
-             patch.object(MockConnectionInfo, 'parameter_status', Mock(return_value='off')), \
+             patch.object(MockConnect, 'get_parameter_status', Mock(return_value='off')), \
              self.assertRaises(SystemExit) as e:
             _main()
         self.assertIn('The provided user does not have superuser privilege', e.exception.code)
@@ -334,7 +338,7 @@ class TestGenerateConfig(unittest.TestCase):
                 _main()
             self.assertIn('Failed to read pg_ident.conf', e.exception.code)
 
-            # 9. Failed PG connecttion
+            # 9. Failed PG connection
             from . import psycopg
             with patch('patroni.psycopg.connect', side_effect=psycopg.Error), \
                  self.assertRaises(SystemExit) as e:
@@ -348,7 +352,10 @@ class TestGenerateConfig(unittest.TestCase):
             self.assertIn('Unexpected exception', e.exception.code)
 
     def test_get_address(self):
-        with patch('socket.getaddrinfo', Mock(side_effect=Exception)), \
+        with patch('socket.getaddrinfo', Mock(side_effect=[[(2, 1, 6, '', ('127.0.0.1', 0))],
+                                                           Exception])), \
+             patch('socket.gethostname', Mock(return_value='foo')), \
              patch('logging.warning') as mock_warning:
+            self.assertEqual(get_address(), ('foo', '127.0.0.1'))
             self.assertEqual(get_address(), (NO_VALUE_MSG, NO_VALUE_MSG))
             self.assertIn('Failed to obtain address: %r', mock_warning.call_args_list[0][0])

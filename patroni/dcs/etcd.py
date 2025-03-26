@@ -1,32 +1,36 @@
 from __future__ import absolute_import
+
 import abc
-import etcd
 import json
 import logging
 import os
-import urllib3.util.connection
 import random
 import socket
 import time
 
 from collections import defaultdict
 from copy import deepcopy
-from dns.exception import DNSException
-from dns import resolver
 from http.client import HTTPException
 from queue import Queue
 from threading import Thread
-from typing import Any, Callable, Collection, Dict, List, Optional, Union, Tuple, Type, TYPE_CHECKING
+from typing import Any, Callable, Collection, Dict, List, Optional, Tuple, Type, TYPE_CHECKING, Union
 from urllib.parse import urlparse
-from urllib3 import Timeout
-from urllib3.exceptions import HTTPError, ReadTimeoutError, ProtocolError
 
-from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, Status, SyncState, \
-    TimelineHistory, ReturnFalseException, catch_return_false_exception
+import etcd
+import urllib3.util.connection
+
+from dns import resolver
+from dns.exception import DNSException
+from urllib3 import Timeout
+from urllib3.exceptions import HTTPError, ProtocolError, ReadTimeoutError
+
 from ..exceptions import DCSError
 from ..postgresql.mpp import AbstractMPP
 from ..request import get as requests_get
 from ..utils import Retry, RetryFailedError, split_host_port, uri, USER_AGENT
+from . import AbstractDCS, catch_return_false_exception, Cluster, ClusterConfig, \
+    Failover, Leader, Member, ReturnFalseException, Status, SyncState, TimelineHistory
+
 if TYPE_CHECKING:  # pragma: no cover
     from ..config import Config
 
@@ -41,7 +45,8 @@ class EtcdError(DCSError):
     pass
 
 
-_AddrInfo = Tuple[socket.AddressFamily, socket.SocketKind, int, str, Union[Tuple[str, int], Tuple[str, int, int, int]]]
+_AddrInfo = Tuple[socket.AddressFamily, socket.SocketKind, int, str,
+                  Union[Tuple[str, int], Tuple[str, int, int, int], Tuple[int, bytes]]]
 
 
 class DnsCachingResolver(Thread):
@@ -346,7 +351,9 @@ class AbstractEtcdClientWithFailover(abc.ABC, etcd.Client):
     def _get_machines_cache_from_dns(self, host: str, port: int) -> List[str]:
         """One host might be resolved into multiple ip addresses. We will make list out of it"""
         if self.protocol == 'http':
-            ret = [uri(self.protocol, res[-1][:2]) for res in self._dns_resolver.resolve(host, port)]
+            # Filter out unexpected results when python is compiled with --disable-ipv6 and running on IPv6 system.
+            ret = [uri(self.protocol, (res[4][0], res[4][1])) for res in self._dns_resolver.resolve(host, port)
+                   if isinstance(res[4][0], str) and isinstance(res[4][1], int)]
             if ret:
                 return list(set(ret))
         return [uri(self.protocol, (host, port))]

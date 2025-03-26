@@ -8,17 +8,50 @@ import os
 import sys
 
 from copy import deepcopy
+from io import TextIOWrapper
 from logging.handlers import RotatingFileHandler
-from queue import Queue, Full
+from queue import Full, Queue
 from threading import Lock, Thread
+from typing import Any, cast, Dict, List, Optional, TYPE_CHECKING, Union
 
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
-
-from .utils import deep_compare
+from .file_perm import pg_perm
+from .utils import deep_compare, parse_int
 
 type_logformat = Union[List[Union[str, Dict[str, Any], Any]], str, Any]
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class PatroniFileHandler(RotatingFileHandler):
+    """Wrapper of :class:`RotatingFileHandler` to handle permissions of log files. """
+
+    def __init__(self, filename: str, mode: Optional[int]) -> None:
+        """Create a new :class:`PatroniFileHandler` instance.
+
+        :param filename: basename for log files.
+        :param mode: permissions for log files.
+        """
+        self.set_log_file_mode(mode)
+        super(PatroniFileHandler, self).__init__(filename)
+
+    def set_log_file_mode(self, mode: Optional[int]) -> None:
+        """Set mode for Patroni log files.
+
+        :param mode: permissions for log files.
+
+        .. note::
+            If *mode* is not specified, we calculate it from the `umask` value.
+        """
+        self._log_file_mode = 0o666 & ~pg_perm.orig_umask if mode is None else mode
+
+    def _open(self) -> TextIOWrapper:
+        """Open a new log file and assign permissions.
+
+        :returns: the resulting stream.
+        """
+        ret = super(PatroniFileHandler, self)._open()
+        os.chmod(self.baseFilename, self._log_file_mode)
+        return ret
 
 
 def debug_exception(self: logging.Logger, msg: object, *args: Any, **kwargs: Any) -> None:
@@ -325,6 +358,7 @@ class PatroniLogger(Thread):
             jsonformat = logformat
             rename_fields = {}
         elif isinstance(logformat, list):
+            logformat = cast(List[Any], logformat)
             log_fields: List[str] = []
             rename_fields: Dict[str, str] = {}
 
@@ -332,6 +366,7 @@ class PatroniLogger(Thread):
                 if isinstance(field, str):
                     log_fields.append(field)
                 elif isinstance(field, dict):
+                    field = cast(Dict[str, Any], field)
                     for original_field, renamed_field in field.items():
                         if isinstance(renamed_field, str):
                             log_fields.append(original_field)
@@ -358,13 +393,16 @@ class PatroniLogger(Thread):
             _LOGGER.warning('Expected log format to be a string or a list, but got "%s"', _type(logformat))
 
         try:
-            from pythonjsonlogger import jsonlogger
-            if hasattr(jsonlogger, 'RESERVED_ATTRS') \
-                    and 'taskName' not in jsonlogger.RESERVED_ATTRS:  # pyright: ignore [reportUnnecessaryContains]
-                # compatibility with python 3.12, that added a new attribute to LogRecord
-                jsonlogger.RESERVED_ATTRS += ('taskName',)
+            try:
+                from pythonjsonlogger import json as jsonlogger  # pyright: ignore
+            except ImportError:  # pragma: no cover
+                from pythonjsonlogger import jsonlogger
+                if hasattr(jsonlogger, 'RESERVED_ATTRS') \
+                        and 'taskName' not in jsonlogger.RESERVED_ATTRS:  # pyright: ignore [reportPrivateImportUsage]
+                    # compatibility with python 3.12, that added a new attribute to LogRecord
+                    jsonlogger.RESERVED_ATTRS += ('taskName',)  # pyright: ignore
 
-            return jsonlogger.JsonFormatter(
+            return jsonlogger.JsonFormatter(  # pyright: ignore [reportPrivateImportUsage]
                 jsonformat,
                 dateformat,
                 rename_fields=rename_fields,
@@ -423,15 +461,16 @@ class PatroniLogger(Thread):
             handler = self.log_handler
 
             if 'dir' in config:
-                if not isinstance(handler, RotatingFileHandler):
-                    handler = RotatingFileHandler(os.path.join(config['dir'], __name__))
-
+                mode = parse_int(config.get('mode'))
+                if not isinstance(handler, PatroniFileHandler):
+                    handler = PatroniFileHandler(os.path.join(config['dir'], __name__), mode)
+                handler.set_log_file_mode(mode)
                 max_file_size = int(config.get('file_size', 25000000))
                 handler.maxBytes = max_file_size  # pyright: ignore [reportAttributeAccessIssue]
                 handler.backupCount = int(config.get('file_num', 4))
             # we can't use `if not isinstance(handler, logging.StreamHandler)` below,
-            # because RotatingFileHandler is a child of StreamHandler!!!
-            elif handler is None or isinstance(handler, RotatingFileHandler):
+            # because RotatingFileHandler and PatroniFileHandler are children of StreamHandler!!!
+            elif handler is None or isinstance(handler, PatroniFileHandler):
                 handler = logging.StreamHandler()
 
             is_new_handler = handler != self.log_handler
@@ -454,7 +493,7 @@ class PatroniLogger(Thread):
 
         .. note::
             It is used to remove different handlers that were configured previous to a reload in the configuration,
-            e.g. if we are switching from :class:`~logging.handlers.RotatingFileHandler` to
+            e.g. if we are switching from :class:`PatroniFileHandler` to
             class:`~logging.StreamHandler` and vice-versa.
         """
         while True:
@@ -478,6 +517,7 @@ class PatroniLogger(Thread):
             self._root_logger.removeHandler(self._proxy_handler)
 
         prev_record = None
+        prev_hb_msg = ''
 
         while True:
             self._close_old_handlers()
@@ -496,14 +536,32 @@ class PatroniLogger(Thread):
                     prev_record, record = record, None
                 else:
                     if prev_record and prev_record.thread == record.thread:
-                        if not (record.msg.startswith('no action. ') or record.msg.startswith('PAUSE: no action')):
+                        if self._is_heartbeat_msg(record):
+                            config = self._config or {}
+                            deduplicate_heartbeat_logs = config.get('deduplicate_heartbeat_logs', False)
+                            if record.msg == prev_hb_msg and deduplicate_heartbeat_logs:
+                                record = None
+                            else:
+                                prev_hb_msg = record.msg
+                        else:
                             self.log_handler.handle(prev_record)
+                            prev_hb_msg = None
                         prev_record = None
 
             if record:
                 self.log_handler.handle(record)
 
             self._queue_handler.queue.task_done()
+
+    @staticmethod
+    def _is_heartbeat_msg(record: logging.LogRecord) -> bool:
+        """Checks if the given record contains a heartbeat message.
+
+        :param record: the record to check.
+
+        :returns: ``True`` if the record contains a heartbeat message, ``False`` otherwise.
+        """
+        return record.msg.startswith('no action. ') or record.msg.startswith('PAUSE: no action')
 
     def shutdown(self) -> None:
         """Shut down the logger thread."""

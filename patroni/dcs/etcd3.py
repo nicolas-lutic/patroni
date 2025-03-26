@@ -1,26 +1,29 @@
 from __future__ import absolute_import
+
 import base64
-import etcd
 import json
 import logging
 import os
 import socket
 import sys
 import time
-import urllib3
 
 from collections import defaultdict
 from enum import IntEnum
-from urllib3.exceptions import ReadTimeoutError, ProtocolError
 from threading import Condition, Lock, Thread
 from typing import Any, Callable, Collection, Dict, Iterator, List, Optional, Tuple, Type, TYPE_CHECKING, Union
 
-from . import ClusterConfig, Cluster, Failover, Leader, Member, Status, SyncState, \
-    TimelineHistory, catch_return_false_exception
-from .etcd import AbstractEtcdClientWithFailover, AbstractEtcd, catch_etcd_errors, DnsCachingResolver, Retry
+import etcd
+import urllib3
+
+from urllib3.exceptions import ProtocolError, ReadTimeoutError
+
 from ..exceptions import DCSError, PatroniException
 from ..postgresql.mpp import AbstractMPP
 from ..utils import deep_compare, enable_keepalive, iter_response_objects, RetryFailedError, USER_AGENT
+from . import catch_return_false_exception, Cluster, ClusterConfig, \
+    Failover, Leader, Member, Status, SyncState, TimelineHistory
+from .etcd import AbstractEtcd, AbstractEtcdClientWithFailover, catch_etcd_errors, DnsCachingResolver, Retry
 
 logger = logging.getLogger(__name__)
 
@@ -147,8 +150,7 @@ errStringToClientError = {getattr(s, 'error'): s for s in Etcd3ClientError.get_s
 errCodeToClientError = {getattr(s, 'code'): s for s in Etcd3ClientError.__subclasses__()}
 
 
-def _raise_for_data(data: Union[bytes, str, Dict[str, Union[Any, Dict[str, Any]]]],
-                    status_code: Optional[int] = None) -> Etcd3ClientError:
+def _raise_for_data(data: Union[bytes, str, Dict[str, Any]], status_code: Optional[int] = None) -> Etcd3ClientError:
     try:
         if TYPE_CHECKING:  # pragma: no cover
             assert isinstance(data, dict)

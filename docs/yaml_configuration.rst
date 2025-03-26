@@ -29,12 +29,17 @@ Log
 -  **static_fields**: add additional fields to the log. This option is only available when the log type is set to **json**.
 -  **max\_queue\_size**: Patroni is using two-step logging. Log records are written into the in-memory queue and there is a separate thread which pulls them from the queue and writes to stderr or file. The maximum size of the internal queue is limited by default by **1000** records, which is enough to keep logs for the past 1h20m.
 -  **dir**: Directory to write application logs to. The directory must exist and be writable by the user executing Patroni. If you set this value, the application will retain 4 25MB logs by default. You can tune those retention values with `file_num` and `file_size` (see below).
+-  **mode**: Permissions for log files (for example, ``0644``). If not specified, permissions will be set based on the current umask value.
 -  **file\_num**: The number of application logs to retain.
 -  **file\_size**: Size of patroni.log file (in bytes) that triggers a log rolling.
 -  **loggers**: This section allows redefining logging level per python module
 
    -  **patroni.postmaster: WARNING**
    -  **urllib3: DEBUG**
+-  **deduplicate_heartbeat_logs**: If set to ``true``, successive heartbeat logs that are identical shall not be output. Default value is ``false``.
+
+.. warning::
+   The time the HA loop executes at can be very valuable information in diagnosing failovers due to resource exhaustion and similar problems. When ``deduplicate_heartbeat_logs`` is set to ``true`` there will be no log generated for the HA loop execution (unless the leader changes) and hence this potentially useful information will not be available from the logs.
 
 Here is an example of how to config patroni to log in json format.
 
@@ -103,9 +108,9 @@ Most of the parameters are optional, but you have to specify one of the **host**
 -  **consistency**: (optional) Select consul consistency mode. Possible values are ``default``, ``consistent``, or ``stale`` (more details in `consul API reference <https://www.consul.io/api/features/consistency.html/>`__)
 -  **checks**: (optional) list of Consul health checks used for the session. By default an empty list is used.
 -  **register\_service**: (optional) whether or not to register a service with the name defined by the scope parameter and the tag master, primary, replica, or standby-leader depending on the node's role. Defaults to **false**.
--  **service\_tags**: (optional) additional static tags to add to the Consul service apart from the role (``master``/``primary``/``replica``/``standby-leader``). By default an empty list is used.
+-  **service\_tags**: (optional) additional static tags to add to the Consul service apart from the role (``primary``/``replica``/``standby-leader``). By default an empty list is used.
 -  **service\_check\_interval**: (optional) how often to perform health check against registered url. Defaults to '5s'.
--  **service\_check\_tls\_server\_name**: (optional) overide SNI host when connecting via TLS, see also `consul agent check API reference <https://www.consul.io/api-docs/agent/check#tlsservername>`__.
+-  **service\_check\_tls\_server\_name**: (optional) override SNI host when connecting via TLS, see also `consul agent check API reference <https://www.consul.io/api-docs/agent/check#tlsservername>`__.
 
 The ``token`` needs to have the following ACL permissions:
 
@@ -177,11 +182,12 @@ Kubernetes
 -  **namespace**: (optional) Kubernetes namespace where Patroni pod is running. Default value is `default`.
 -  **labels**: Labels in format ``{label1: value1, label2: value2}``. These labels will be used to find existing objects (Pods and either Endpoints or ConfigMaps) associated with the current cluster. Also Patroni will set them on every object (Endpoint or ConfigMap) it creates.
 -  **scope\_label**: (optional) name of the label containing cluster name. Default value is `cluster-name`.
--  **role\_label**: (optional) name of the label containing role (master or replica or other custom value). Patroni will set this label on the pod it runs in. Default value is ``role``.
--  **leader\_label\_value**: (optional) value of the pod label when Postgres role is ``master``. Default value is ``master``.
+-  **bootstrap\_labels**: (optional) Labels in format ``{label1: value1, label2: value2}``. These labels will be assigned to a Patroni pod when its state is either ``initializing new cluster``, ``running custom bootstrap script``, ``starting after custom bootstrap`` or ``creating replica``.
+-  **role\_label**: (optional) name of the label containing role (`primary`, `replica`, or other custom value). Patroni will set this label on the pod it runs in. Default value is ``role``.
+-  **leader\_label\_value**: (optional) value of the pod label when Postgres role is ``primary``. Default value is ``primary``.
 -  **follower\_label\_value**: (optional) value of the pod label when Postgres role is ``replica``. Default value is ``replica``.
--  **standby\_leader\_label\_value**: (optional) value of the pod label when Postgres role is ``standby_leader``. Default value is ``master``.
--  **tmp_\role\_label**: (optional) name of the temporary label containing role (master or replica). Value of this label will always use the default of corresponding role. Set only when necessary.
+-  **standby\_leader\_label\_value**: (optional) value of the pod label when Postgres role is ``standby_leader``. Default value is ``primary``.
+-  **tmp\_role\_label**: (optional) name of the temporary label containing role (`primary` or `replica`). Value of this label will always use the default of corresponding role. Set only when necessary.
 -  **use\_endpoints**: (optional) if set to true, Patroni will use Endpoints instead of ConfigMaps to run leader elections and keep cluster state.
 -  **pod\_ip**: (optional) IP address of the pod Patroni is running in. This value is required when `use_endpoints` is enabled and is used to populate the leader endpoint subsets when the pod's PostgreSQL is promoted.
 -  **ports**: (optional) if the Service object has the name for the port, the same name must appear in the Endpoint object, otherwise service won't work. For example, if your service is defined as ``{Kind: Service, spec: {ports: [{name: postgresql, port: 5432, targetPort: 5432}]}}``, then you have to set ``kubernetes.ports: [{"name": "postgresql", "port": 5432}]`` and Patroni will use it for updating subsets of the leader Endpoint. This parameter is used only if `kubernetes.use_endpoints` is set.
@@ -238,9 +244,10 @@ PostgreSQL
          -  **sslkey**: (optional) maps to the `sslkey <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLKEY>`__ connection parameter, which specifies the location of the secret key used with the client's certificate.
          -  **sslpassword**: (optional) maps to the `sslpassword <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLPASSWORD>`__ connection parameter, which specifies the password for the secret key specified in ``sslkey``.
          -  **sslcert**: (optional) maps to the `sslcert <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLCERT>`__ connection parameter, which specifies the location of the client certificate.
-         -  **sslrootcert**: (optional) maps to the `sslrootcert <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLROOTCERT>`__ connection parameter, which specifies the location of a file containing one ore more certificate authorities (CA) certificates that the client will use to verify a server's certificate.
+         -  **sslrootcert**: (optional) maps to the `sslrootcert <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLROOTCERT>`__ connection parameter, which specifies the location of a file containing one or more certificate authorities (CA) certificates that the client will use to verify a server's certificate.
          -  **sslcrl**: (optional) maps to the `sslcrl <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLCRL>`__ connection parameter, which specifies the location of a file containing a certificate revocation list. A client will reject connecting to any server that has a certificate present in this list.
          -  **sslcrldir**: (optional) maps to the `sslcrldir <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLCRLDIR>`__ connection parameter, which specifies the location of a directory with files containing a certificate revocation list. A client will reject connecting to any server that has a certificate present in this list.
+         -  **sslnegotiation**: (optional) maps to the `sslnegotiation <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLNEGOTIATION>`__ connection parameter, which controls how SSL encryption is negotiated with the server, if SSL is used.
          -  **gssencmode**: (optional) maps to the `gssencmode <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-GSSENCMODE>`__ connection parameter, which determines whether or with what priority a secure GSS TCP/IP connection will be negotiated with the server
          -  **channel_binding**: (optional) maps to the `channel_binding <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-CHANNEL-BINDING>`__ connection parameter, which controls the client's use of channel binding.
       -  **replication**:
@@ -251,9 +258,10 @@ PostgreSQL
          -  **sslkey**: (optional) maps to the `sslkey <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLKEY>`__ connection parameter, which specifies the location of the secret key used with the client's certificate.
          -  **sslpassword**: (optional) maps to the `sslpassword <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLPASSWORD>`__ connection parameter, which specifies the password for the secret key specified in ``sslkey``.
          -  **sslcert**: (optional) maps to the `sslcert <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLCERT>`__ connection parameter, which specifies the location of the client certificate.
-         -  **sslrootcert**: (optional) maps to the `sslrootcert <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLROOTCERT>`__ connection parameter, which specifies the location of a file containing one ore more certificate authorities (CA) certificates that the client will use to verify a server's certificate.
+         -  **sslrootcert**: (optional) maps to the `sslrootcert <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLROOTCERT>`__ connection parameter, which specifies the location of a file containing one or more certificate authorities (CA) certificates that the client will use to verify a server's certificate.
          -  **sslcrl**: (optional) maps to the `sslcrl <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLCRL>`__ connection parameter, which specifies the location of a file containing a certificate revocation list. A client will reject connecting to any server that has a certificate present in this list.
          -  **sslcrldir**: (optional) maps to the `sslcrldir <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLCRLDIR>`__ connection parameter, which specifies the location of a directory with files containing a certificate revocation list. A client will reject connecting to any server that has a certificate present in this list.
+         -  **sslnegotiation**: (optional) maps to the `sslnegotiation <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLNEGOTIATION>`__ connection parameter, which controls how SSL encryption is negotiated with the server, if SSL is used.
          -  **gssencmode**: (optional) maps to the `gssencmode <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-GSSENCMODE>`__ connection parameter, which determines whether or with what priority a secure GSS TCP/IP connection will be negotiated with the server
          -  **channel_binding**: (optional) maps to the `channel_binding <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-CHANNEL-BINDING>`__ connection parameter, which controls the client's use of channel binding.
       -  **rewind**:
@@ -264,9 +272,10 @@ PostgreSQL
          -  **sslkey**: (optional) maps to the `sslkey <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLKEY>`__ connection parameter, which specifies the location of the secret key used with the client's certificate.
          -  **sslpassword**: (optional) maps to the `sslpassword <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLPASSWORD>`__ connection parameter, which specifies the password for the secret key specified in ``sslkey``.
          -  **sslcert**: (optional) maps to the `sslcert <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLCERT>`__ connection parameter, which specifies the location of the client certificate.
-         -  **sslrootcert**: (optional) maps to the `sslrootcert <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLROOTCERT>`__ connection parameter, which specifies the location of a file containing one ore more certificate authorities (CA) certificates that the client will use to verify a server's certificate.
+         -  **sslrootcert**: (optional) maps to the `sslrootcert <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLROOTCERT>`__ connection parameter, which specifies the location of a file containing one or more certificate authorities (CA) certificates that the client will use to verify a server's certificate.
          -  **sslcrl**: (optional) maps to the `sslcrl <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLCRL>`__ connection parameter, which specifies the location of a file containing a certificate revocation list. A client will reject connecting to any server that has a certificate present in this list.
          -  **sslcrldir**: (optional) maps to the `sslcrldir <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLCRLDIR>`__ connection parameter, which specifies the location of a directory with files containing a certificate revocation list. A client will reject connecting to any server that has a certificate present in this list.
+         -  **sslnegotiation**: (optional) maps to the `sslnegotiation <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-SSLNEGOTIATION>`__ connection parameter, which controls how SSL encryption is negotiated with the server, if SSL is used.
          -  **gssencmode**: (optional) maps to the `gssencmode <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-GSSENCMODE>`__ connection parameter, which determines whether or with what priority a secure GSS TCP/IP connection will be negotiated with the server
          -  **channel_binding**: (optional) maps to the `channel_binding <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNECT-CHANNEL-BINDING>`__ connection parameter, which controls the client's use of channel binding.
 
@@ -397,8 +406,9 @@ Tags
 -  **noloadbalance**: ``true`` or ``false``. If set to ``true`` the node will return HTTP Status Code 503 for the ``GET /replica`` REST API health-check and therefore will be excluded from the load-balancing. Defaults to ``false``.
 -  **replicatefrom**: The name of another replica to replicate from. Used to support cascading replication.
 -  **nosync**: ``true`` or ``false``. If set to ``true`` the node will never be selected as a synchronous replica.
+-  **sync_priority**: integer, controls the priority this node should have during synchronous replica selection when ``synchronous_mode`` is set to ``on``. Nodes with higher priority will be preferred over lower-priority nodes. If the ``sync_priority`` is 0 or negative - such node is not allowed to be written to ``synchronous_standby_names`` PostgreSQL parameter (similar to ``nosync: true``). Keep in mind, that this parameter has the opposite meaning to ``sync_priority`` value reported in ``pg_stat_replication`` view.
 -  **nofailover**: ``true`` or ``false``, controls whether this node is allowed to participate in the leader race and become a leader. Defaults to ``false``, meaning this node _can_ participate in leader races. 
--  **failover_priority**: integer, controls the priority that this node should have during failover. Nodes with higher priority will be preferred over lower priority nodes if they received/replayed the same amount of WAL. However, nodes with higher values of receive/replay LSN are preferred regardless of their priority. If the ``failover_priority`` is 0 or negative - such node is not allowed to participate in the leader race and to become a leader (similar to ``nofailover: true``).
+-  **failover_priority**: integer, controls the priority this node should have during failover. Nodes with higher priority will be preferred over lower-priority nodes if they received/replayed the same amount of WAL. However, nodes with higher values of receive/replay LSN are preferred regardless of their priority. If the ``failover_priority`` is 0 or negative - such node is not allowed to participate in the leader race and to become a leader (similar to ``nofailover: true``).
 -  **nostream**: ``true`` or ``false``. If set to ``true`` the node will not use replication protocol to stream WAL. It will rely instead on archive recovery (if ``restore_command`` is configured) and ``pg_wal``/``pg_xlog`` polling. It also disables copying and synchronization of permanent logical replication slots on the node itself and all its cascading replicas. Setting this tag on primary node has no effect.
 
 .. warning::

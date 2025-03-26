@@ -1,10 +1,12 @@
-import botocore
-import botocore.awsrequest
 import sys
 import unittest
 
-from unittest.mock import Mock, PropertyMock, patch
 from collections import namedtuple
+from unittest.mock import Mock, patch, PropertyMock
+
+import botocore
+import botocore.awsrequest
+
 from patroni.scripts.aws import AWSConnection, main as _main
 
 
@@ -61,7 +63,7 @@ class TestAWSConnection(unittest.TestCase):
         self.assertFalse(conn.on_role_change("primary"))
 
     @patch.object(botocore.awsrequest.AWSResponse, 'text', PropertyMock(return_value='boo'))
-    def test_aws_bizare_response(self):
+    def test_aws_bizarre_response(self):
         conn = AWSConnection('test')
         self.assertFalse(conn.aws_available())
 

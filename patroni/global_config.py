@@ -8,7 +8,7 @@ import sys
 import types
 
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
+from typing import Any, cast, Dict, List, Optional, TYPE_CHECKING
 
 from .collections import EMPTY_DICT
 from .utils import parse_bool, parse_int
@@ -106,16 +106,22 @@ class GlobalConfig(types.ModuleType):
         return self.check_mode('pause')
 
     @property
+    def is_quorum_commit_mode(self) -> bool:
+        """:returns: ``True`` if quorum commit replication is requested"""
+        return str(self.get('synchronous_mode')).lower() == 'quorum'
+
+    @property
     def is_synchronous_mode(self) -> bool:
         """``True`` if synchronous replication is requested and it is not a standby cluster config."""
-        return self.check_mode('synchronous_mode') and not self.is_standby_cluster
+        return (self.check_mode('synchronous_mode') is True or self.is_quorum_commit_mode) \
+            and not self.is_standby_cluster
 
     @property
     def is_synchronous_mode_strict(self) -> bool:
         """``True`` if at least one synchronous node is required."""
         return self.check_mode('synchronous_mode_strict')
 
-    def get_standby_cluster_config(self) -> Union[Dict[str, Any], Any]:
+    def get_standby_cluster_config(self) -> Any:
         """Get ``standby_cluster`` configuration.
 
         :returns: a copy of ``standby_cluster`` configuration.
@@ -127,18 +133,20 @@ class GlobalConfig(types.ModuleType):
         """``True`` if global configuration has a valid ``standby_cluster`` section."""
         config = self.get_standby_cluster_config()
         return isinstance(config, dict) and\
-            bool(config.get('host') or config.get('port') or config.get('restore_command'))
+            any(cast(Dict[str, Any], config).get(p) for p in ('host', 'port', 'restore_command'))
 
-    def get_int(self, name: str, default: int = 0) -> int:
+    def get_int(self, name: str, default: int = 0, base_unit: Optional[str] = None) -> int:
         """Gets current value of *name* from the global configuration and try to return it as :class:`int`.
 
         :param name: name of the parameter.
         :param default: default value if *name* is not in the configuration or invalid.
+        :param base_unit: an optional base unit to convert value of *name* parameter to.
+                          Not used if the value does not contain a unit.
 
         :returns: currently configured value of *name* from the global configuration or *default* if it is not set or
             invalid.
         """
-        ret = parse_int(self.get(name))
+        ret = parse_int(self.get(name), base_unit)
         return default if ret is None else ret
 
     @property
@@ -224,6 +232,14 @@ class GlobalConfig(types.ModuleType):
                         or self.get('permanent_slots')
                         or self.get('slots')
                         or EMPTY_DICT.copy())
+
+    @property
+    def member_slots_ttl(self) -> int:
+        """Currently configured value of ``member_slots_ttl`` from the global configuration converted to seconds.
+
+        Assume ``1800`` if it is not set or invalid.
+        """
+        return self.get_int('member_slots_ttl', 1800, base_unit='s')
 
 
 sys.modules[__name__] = GlobalConfig()

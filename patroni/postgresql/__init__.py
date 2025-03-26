@@ -9,28 +9,30 @@ import time
 from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime
+from enum import IntEnum
+from threading import current_thread, Lock
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TYPE_CHECKING, Union
+
 from dateutil import tz
 from psutil import TimeoutExpired
-from threading import current_thread, Lock
-from typing import Any, Callable, Dict, Iterator, List, Optional, Union, Tuple, TYPE_CHECKING
 
+from .. import global_config, psycopg
+from ..async_executor import CriticalTask
+from ..collections import CaseInsensitiveDict, CaseInsensitiveSet, EMPTY_DICT
+from ..dcs import Cluster, Leader, Member, slot_name_from_member_name
+from ..exceptions import PostgresConnectionException
+from ..tags import Tags
+from ..utils import data_directory_is_empty, parse_int, polling_loop, Retry, RetryFailedError
 from .bootstrap import Bootstrap
 from .callback_executor import CallbackAction, CallbackExecutor
 from .cancellable import CancellableSubprocess
 from .config import ConfigHandler, mtime
 from .connection import ConnectionPool, get_connection_cursor
-from .misc import parse_history, parse_lsn, postgres_major_version_to_int
+from .misc import parse_history, parse_lsn, postgres_major_version_to_int, PostgresqlState
 from .mpp import AbstractMPP
 from .postmaster import PostmasterProcess
 from .slots import SlotsHandler
 from .sync import SyncHandler
-from .. import global_config, psycopg
-from ..async_executor import CriticalTask
-from ..collections import CaseInsensitiveSet, CaseInsensitiveDict, EMPTY_DICT
-from ..dcs import Cluster, Leader, Member, SLOT_ADVANCE_AVAILABLE_VERSION
-from ..exceptions import PostgresConnectionException
-from ..utils import Retry, RetryFailedError, polling_loop, data_directory_is_empty, parse_int
-from ..tags import Tags
 
 if TYPE_CHECKING:  # pragma: no cover
     from psycopg import Connection as Connection3, Cursor
@@ -38,12 +40,22 @@ if TYPE_CHECKING:  # pragma: no cover
 
 logger = logging.getLogger(__name__)
 
-STATE_RUNNING = 'running'
-STATE_REJECT = 'rejecting connections'
-STATE_NO_RESPONSE = 'not responding'
-STATE_UNKNOWN = 'unknown'
-
 STOP_POLLING_INTERVAL = 1
+
+
+class PgIsReadyStatus(IntEnum):
+    """Possible PostgreSQL connection status ``pg_isready`` utility can report.
+
+    :cvar RUNNING: return code 0. PostgreSQL is accepting connections normally.
+    :cvar REJECT: return code 1. PostgreSQL is rejecting connections.
+    :cvar NO_RESPONSE: return code 2. There was no response to the connection attempt.
+    :cvar UNKNOWN: Return code 3. No connection attempt was made, something went wrong.
+    """
+
+    RUNNING = 0
+    REJECT = 1
+    NO_RESPONSE = 2
+    UNKNOWN = 3
 
 
 @contextmanager
@@ -75,16 +87,18 @@ class Postgresql(object):
         self._major_version = self.get_major_version()
 
         self._state_lock = Lock()
-        self.set_state('stopped')
+        self.set_state(PostgresqlState.STOPPED)
 
         self._pending_restart_reason = CaseInsensitiveDict()
         self.connection_pool = ConnectionPool()
         self._connection = self.connection_pool.get('heartbeat')
         self.mpp_handler = mpp.get_handler_impl(self)
+        self._bin_dir = config.get('bin_dir') or ''
+        self._role_lock = Lock()
+        self.set_role('uninitialized')
         self.config = ConfigHandler(self, config)
         self.config.check_directories()
 
-        self._bin_dir = config.get('bin_dir') or ''
         self.bootstrap = Bootstrap(self)
         self.bootstrapping = False
         self.__thread_ident = current_thread().ident
@@ -106,12 +120,11 @@ class Postgresql(object):
         self._is_leader_retry = Retry(max_tries=1, deadline=config['retry_timeout'] / 2.0, max_delay=1,
                                       retry_exceptions=PostgresConnectionException)
 
-        self._role_lock = Lock()
         self.set_role(self.get_postgres_role_from_data_directory())
         self._state_entry_timestamp = 0
 
         self._cluster_info_state = {}
-        self._has_permanent_slots = True
+        self._should_query_slots = True
         self._enforce_hot_standby_feedback = False
         self._cached_replica_timeline = None
 
@@ -122,26 +135,26 @@ class Postgresql(object):
 
         if self.is_running():
             # If we found postmaster process we need to figure out whether postgres is accepting connections
-            self.set_state('starting')
+            self.set_state(PostgresqlState.STARTING)
             self.check_startup_state_changed()
 
-        if self.state == 'running':  # we are "joining" already running postgres
+        if self.state == PostgresqlState.RUNNING:  # we are "joining" already running postgres
             # we know that PostgreSQL is accepting connections and can read some GUC's from pg_settings
             self.config.load_current_server_parameters()
 
-            self.set_role('master' if self.is_primary() else 'replica')
+            self.set_role('primary' if self.is_primary() else 'replica')
 
             hba_saved = self.config.replace_pg_hba()
             ident_saved = self.config.replace_pg_ident()
 
-            if self.major_version < 120000 or self.role in ('master', 'primary'):
+            if self.major_version < 120000 or self.role == 'primary':
                 # If PostgreSQL is running as a primary or we run PostgreSQL that is older than 12 we can
                 # call reload_config() once again (the first call happened in the ConfigHandler constructor),
                 # so that it can figure out if config files should be updated and pg_ctl reload executed.
                 self.config.reload_config(config, sighup=bool(hba_saved or ident_saved))
             elif hba_saved or ident_saved:
                 self.reload()
-        elif not self.is_running() and self.role in ('master', 'primary'):
+        elif not self.is_running() and self.role == 'primary':
             self.set_role('demoted')
 
     @property
@@ -182,6 +195,11 @@ class Postgresql(object):
         return 'lsn' if self._major_version >= 100000 else 'location'
 
     @property
+    def supports_quorum_commit(self) -> bool:
+        """``True`` if quorum commit is supported by Postgres."""
+        return self._major_version >= 100000
+
+    @property
     def supports_multiple_sync(self) -> bool:
         """:returns: `True` if Postgres version supports more than one synchronous node."""
         return self._major_version >= 90600
@@ -189,7 +207,7 @@ class Postgresql(object):
     @property
     def can_advance_slots(self) -> bool:
         """``True`` if :attr:``major_version`` is greater than 110000."""
-        return self.major_version >= SLOT_ADVANCE_AVAILABLE_VERSION
+        return self.major_version >= 110000
 
     @property
     def cluster_info_query(self) -> str:
@@ -219,23 +237,27 @@ class Postgresql(object):
                          " pg_catalog.pg_stat_get_activity(w.pid)"
                          " WHERE w.state = 'streaming') r)").format(self.wal_name, self.lsn_name)
                         if global_config.is_synchronous_mode
-                        and self.role in ('master', 'primary', 'promoted') else "'on', '', NULL")
+                        and self.role in ('primary', 'promoted') else "'on', '', NULL")
 
         if self._major_version >= 90600:
+            filter_failover = ' WHERE NOT failover' if self._major_version >= 170000 else ''
             extra = ("pg_catalog.current_setting('restore_command')" if self._major_version >= 120000 else "NULL") +\
                 ", " + ("(SELECT pg_catalog.json_agg(s.*) FROM (SELECT slot_name, slot_type as type, datoid::bigint, "
                         "plugin, catalog_xmin, pg_catalog.pg_wal_lsn_diff(confirmed_flush_lsn, '0/0')::bigint"
                         " AS confirmed_flush_lsn, pg_catalog.pg_wal_lsn_diff(restart_lsn, '0/0')::bigint"
-                        " AS restart_lsn FROM pg_catalog.pg_get_replication_slots()) AS s)"
-                        if self._has_permanent_slots and self.can_advance_slots else "NULL") + extra
-            extra = (", CASE WHEN latest_end_lsn IS NULL THEN NULL ELSE received_tli END,"
-                     " slot_name, conninfo, status, {0} FROM pg_catalog.pg_stat_get_wal_receiver()").format(extra)
+                        f" AS restart_lsn, xmin FROM pg_catalog.pg_get_replication_slots(){filter_failover}) AS s)"
+                        if self._should_query_slots and self.can_advance_slots else "NULL") + extra
+
+            written_lsn = ("pg_catalog.pg_wal_lsn_diff(written_lsn, '0/0')::bigint"
+                           if self._major_version >= 130000 else "NULL")
+            extra = (", CASE WHEN latest_end_lsn IS NULL THEN NULL ELSE received_tli END, {0}, slot_name, "
+                     "conninfo, status, {1} FROM pg_catalog.pg_stat_get_wal_receiver()").format(written_lsn, extra)
             if self.role == 'standby_leader':
                 extra = "timeline_id" + extra + ", pg_catalog.pg_control_checkpoint()"
             else:
                 extra = "0" + extra
         else:
-            extra = "0, NULL, NULL, NULL, NULL, NULL, NULL" + extra
+            extra = "0, NULL, NULL, NULL, NULL, NULL, NULL, NULL" + extra
 
         return ("SELECT " + self.TL_LSN + ", {3}").format(self.wal_name, self.lsn_name, self.wal_flush, extra)
 
@@ -293,10 +315,10 @@ class Postgresql(object):
         initdb = [self.pgcommand('initdb')] + list(args) + [self.data_dir]
         return subprocess.call(initdb, **kwargs) == 0
 
-    def pg_isready(self) -> str:
+    def pg_isready(self) -> PgIsReadyStatus:
         """Runs pg_isready to see if PostgreSQL is accepting connections.
 
-        :returns: 'ok' if PostgreSQL is up, 'reject' if starting up, 'no_resopnse' if not up."""
+        :returns: one of :class:`PgIsReadyStatus` values."""
 
         r = self.connection_pool.conn_kwargs
         cmd = [self.pgcommand('pg_isready'), '-p', r['port'], '-d', self._database]
@@ -310,11 +332,10 @@ class Postgresql(object):
             cmd.extend(['-U', r['user']])
 
         ret = subprocess.call(cmd)
-        return_codes = {0: STATE_RUNNING,
-                        1: STATE_REJECT,
-                        2: STATE_NO_RESPONSE,
-                        3: STATE_UNKNOWN}
-        return return_codes.get(ret, STATE_UNKNOWN)
+        try:
+            return PgIsReadyStatus(ret)
+        except ValueError:
+            return PgIsReadyStatus.UNKNOWN
 
     def reload_config(self, config: Dict[str, Any], sighup: bool = False) -> None:
         self.config.reload_config(config, sighup)
@@ -351,7 +372,7 @@ class Postgresql(object):
         elif self.config.recovery_conf_exists():
             return 'replica'
         else:
-            return 'master'
+            return 'primary'
 
     @property
     def server_version(self) -> int:
@@ -378,7 +399,7 @@ class Postgresql(object):
         try:
             return self._connection.query(sql, *params)
         except PostgresConnectionException as exc:
-            if self.state == 'restarting':
+            if self.state == PostgresqlState.RESTARTING:
                 raise RetryFailedError('cluster is being restarted') from exc
             raise
 
@@ -417,8 +438,7 @@ class Postgresql(object):
         return deepcopy(self.config.get(method, {}) or EMPTY_DICT.copy())
 
     def replica_method_can_work_without_replication_connection(self, method: str) -> bool:
-        return method != 'basebackup' and bool(self.replica_method_options(method).get('no_master')
-                                               or self.replica_method_options(method).get('no_leader'))
+        return method != 'basebackup' and bool(self.replica_method_options(method).get('no_leader'))
 
     def can_create_replica_without_replication_connection(self, replica_methods: Optional[List[str]]) -> bool:
         """ go through the replication methods to see if there are ones
@@ -463,7 +483,7 @@ class Postgresql(object):
             # to have a logical slot or in case if it is the cascading replica.
             self.set_enforce_hot_standby_feedback(not global_config.is_standby_cluster and self.can_advance_slots
                                                   and cluster.should_enforce_hot_standby_feedback(self, tags))
-            self._has_permanent_slots = cluster.has_permanent_slots(self, tags)
+            self._should_query_slots = global_config.member_slots_ttl > 0 or cluster.has_permanent_slots(self, tags)
 
     def _cluster_info_state_get(self, name: str) -> Optional[Any]:
         if not self._cluster_info_state:
@@ -471,17 +491,17 @@ class Postgresql(object):
                 result = self._is_leader_retry(self._query, self.cluster_info_query)[0]
                 cluster_info_state = dict(zip(['timeline', 'wal_position', 'replayed_location',
                                                'received_location', 'replay_paused', 'pg_control_timeline',
-                                               'received_tli', 'slot_name', 'conninfo', 'receiver_state',
-                                               'restore_command', 'slots', 'synchronous_commit',
+                                               'received_tli', 'write_location', 'slot_name', 'conninfo',
+                                               'receiver_state', 'restore_command', 'slots', 'synchronous_commit',
                                                'synchronous_standby_names', 'pg_stat_replication'], result))
-                if self._has_permanent_slots and self.can_advance_slots:
+                if self._should_query_slots and self.can_advance_slots:
                     cluster_info_state['slots'] =\
                         self.slots_handler.process_permanent_slots(cluster_info_state['slots'])
                 self._cluster_info_state = cluster_info_state
             except RetryFailedError as e:  # SELECT failed two times
                 self._cluster_info_state = {'error': str(e)}
-                if not self.is_starting() and self.pg_isready() == STATE_REJECT:
-                    self.set_state('starting')
+                if not self.is_starting() and self.pg_isready() == PgIsReadyStatus.REJECT:
+                    self.set_state(PostgresqlState.STARTING)
 
         if 'error' in self._cluster_info_state:
             raise PostgresConnectionException(self._cluster_info_state['error'])
@@ -492,10 +512,24 @@ class Postgresql(object):
         return self._cluster_info_state_get('replayed_location')
 
     def received_location(self) -> Optional[int]:
-        return self._cluster_info_state_get('received_location')
+        write = self._cluster_info_state_get('write_location')
+        received = self._cluster_info_state_get('received_location')
+        return max(received, write) if received and write else write or received
 
     def slots(self) -> Dict[str, int]:
-        return self._cluster_info_state_get('slots') or {}
+        """Get replication slots state.
+
+        ..note::
+            Since this methods is supposed to be used only by the leader and only to publish state of
+            replication slots to DCS so that other nodes can advance LSN on respective replication slots,
+            we are also adding our own name to the list. All slots that shouldn't be published to DCS
+            later will be filtered out by :meth:`~Cluster.maybe_filter_permanent_slots` method.
+
+        :returns: A :class:`dict` object with replication slot names and LSNs as absolute values.
+        """
+        return {**(self._cluster_info_state_get('slots') or {}),
+                slot_name_from_member_name(self.name): self.last_operation()} \
+            if self.can_advance_slots else {}
 
     def primary_slot_name(self) -> Optional[str]:
         return self._cluster_info_state_get('slot_name')
@@ -523,7 +557,7 @@ class Postgresql(object):
         """Figure out the replication state from input parameters.
 
         .. note::
-            This method could be only called when Postgres is up, running and queries are successfuly executed.
+            This method could be only called when Postgres is up, running and queries are successfully executed.
 
         :is_primary: `True` is postgres is not running in recovery
         :receiver_state: value from `pg_stat_get_wal_receiver.state` or None if Postgres is older than 9.6
@@ -558,7 +592,7 @@ class Postgresql(object):
             return bool(self._cluster_info_state_get('timeline'))
         except PostgresConnectionException:
             logger.warning('Failed to determine PostgreSQL state from the connection, falling back to cached role')
-            return bool(self.is_running() and self.role in ('master', 'primary'))
+            return bool(self.is_running() and self.role == 'primary')
 
     def replay_paused(self) -> bool:
         return self._cluster_info_state_get('replay_paused') or False
@@ -638,6 +672,7 @@ class Postgresql(object):
             if self._postmaster_proc.is_running():
                 return self._postmaster_proc
             self._postmaster_proc = None
+            self._available_gucs = None
 
         # we noticed that postgres was restarted, force syncing of replication slots and check of logical slots
         self.slots_handler.schedule()
@@ -659,7 +694,7 @@ class Postgresql(object):
 
         if self.callback and cb_type in self.callback:
             cmd = self.callback[cb_type]
-            role = 'master' if self.role == 'promoted' else self.role
+            role = 'primary' if self.role == 'promoted' else self.role
             try:
                 cmd = shlex.split(self.callback[cb_type]) + [cb_type, role, self.scope]
                 self._callback_executor.call(cmd)
@@ -676,11 +711,11 @@ class Postgresql(object):
             self._role = value
 
     @property
-    def state(self) -> str:
+    def state(self) -> PostgresqlState:
         with self._state_lock:
             return self._state
 
-    def set_state(self, value: str) -> None:
+    def set_state(self, value: PostgresqlState) -> None:
         with self._state_lock:
             self._state = value
             self._state_entry_timestamp = time.time()
@@ -689,7 +724,7 @@ class Postgresql(object):
         return time.time() - self._state_entry_timestamp
 
     def is_starting(self) -> bool:
-        return self.state == 'starting'
+        return self.state in (PostgresqlState.STARTING, PostgresqlState.BOOTSTRAP_STARTING)
 
     def wait_for_port_open(self, postmaster: PostmasterProcess, timeout: float) -> bool:
         """Waits until PostgreSQL opens ports."""
@@ -699,12 +734,12 @@ class Postgresql(object):
 
             if not postmaster.is_running():
                 logger.error('postmaster is not running')
-                self.set_state('start failed')
+                self.set_state(PostgresqlState.START_FAILED)
                 return False
 
             isready = self.pg_isready()
-            if isready != STATE_NO_RESPONSE:
-                if isready not in [STATE_REJECT, STATE_RUNNING]:
+            if isready != PgIsReadyStatus.NO_RESPONSE:
+                if isready not in [PgIsReadyStatus.REJECT, PgIsReadyStatus.RUNNING]:
                     logger.warning("Can't determine PostgreSQL startup status, assuming running")
                 return True
 
@@ -727,9 +762,11 @@ class Postgresql(object):
         # patroni.
         self.connection_pool.close()
 
+        state = (PostgresqlState.BOOTSTRAP_STARTING if self.bootstrap.running_custom_bootstrap
+                 else PostgresqlState.STARTING)
         if self.is_running():
             logger.error('Cannot start PostgreSQL because one is already running.')
-            self.set_state('starting')
+            self.set_state(state)
             return True
 
         if not block_callbacks:
@@ -737,7 +774,7 @@ class Postgresql(object):
 
         self.set_role(role or self.get_postgres_role_from_data_directory())
 
-        self.set_state('starting')
+        self.set_state(state)
         self.set_pending_restart_reason(CaseInsensitiveDict())
 
         try:
@@ -812,7 +849,7 @@ class Postgresql(object):
                 cur.execute('CHECKPOINT')
         except psycopg.Error:
             logger.exception('Exception during CHECKPOINT')
-            return 'not accessible or not healty'
+            return 'not accessible or not healthy'
 
     def stop(self, mode: str = 'fast', block_callbacks: bool = False, checkpoint: Optional[bool] = None,
              on_safepoint: Optional[Callable[..., Any]] = None, on_shutdown: Optional[Callable[[int, int], Any]] = None,
@@ -836,12 +873,12 @@ class Postgresql(object):
             # block_callbacks is used during restart to avoid
             # running start/stop callbacks in addition to restart ones
             if not block_callbacks:
-                self.set_state('stopped')
+                self.set_state(PostgresqlState.STOPPED)
                 if pg_signaled:
                     self.call_nowait(CallbackAction.ON_STOP)
         else:
             logger.warning('pg_ctl stop failed')
-            self.set_state('stop failed')
+            self.set_state(PostgresqlState.STOP_FAILED)
         return success
 
     def _do_stop(self, mode: str, block_callbacks: bool, checkpoint: bool,
@@ -857,7 +894,7 @@ class Postgresql(object):
             self.checkpoint(timeout=stop_timeout)
 
         if not block_callbacks:
-            self.set_state('stopping')
+            self.set_state(PostgresqlState.STOPPING)
 
         # invoke user-directed before stop script
         self._before_stop()
@@ -947,28 +984,28 @@ class Postgresql(object):
     def check_startup_state_changed(self) -> bool:
         """Checks if PostgreSQL has completed starting up or failed or still starting.
 
-        Should only be called when state == 'starting'
+        Should only be called when state == 'starting [after custom bootstrap]'
 
         :returns: True if state was changed from 'starting'
         """
         ready = self.pg_isready()
 
-        if ready == STATE_REJECT:
+        if ready == PgIsReadyStatus.REJECT:
             return False
-        elif ready == STATE_NO_RESPONSE:
+        elif ready == PgIsReadyStatus.NO_RESPONSE:
             ret = not self.is_running()
             if ret:
-                self.set_state('start failed')
+                self.set_state(PostgresqlState.START_FAILED)
                 self.slots_handler.schedule(False)  # TODO: can remove this?
                 self.config.save_configuration_files(True)  # TODO: maybe remove this?
             return ret
         else:
-            if ready != STATE_RUNNING:
+            if ready != PgIsReadyStatus.RUNNING:
                 # Bad configuration or unexpected OS error. No idea of PostgreSQL status.
                 # Let the main loop of run cycle clean up the mess.
                 logger.warning("%s status returned from pg_isready",
-                               "Unknown" if ready == STATE_UNKNOWN else "Invalid")
-            self.set_state('running')
+                               "Unknown" if ready == PgIsReadyStatus.UNKNOWN else "Invalid")
+            self.set_state(PostgresqlState.RUNNING)
             self.slots_handler.schedule()
             self.config.save_configuration_files(True)
             # TODO: __cb_pending can be None here after PostgreSQL restarts on its own. Do we want to call the callback?
@@ -992,7 +1029,7 @@ class Postgresql(object):
                 return None
             time.sleep(1)
 
-        return self.state == 'running'
+        return self.state == PostgresqlState.RUNNING
 
     def restart(self, timeout: Optional[float] = None, task: Optional[CriticalTask] = None,
                 block_callbacks: bool = False, role: Optional[str] = None,
@@ -1005,13 +1042,14 @@ class Postgresql(object):
 
         :returns: True when restart was successful and timeout did not expire when waiting.
         """
-        self.set_state('restarting')
+        self.set_state(PostgresqlState.RESTARTING)
         if not block_callbacks:
             self.__cb_pending = CallbackAction.ON_RESTART
         ret = self.stop(block_callbacks=True, before_shutdown=before_shutdown)\
             and self.start(timeout, task, True, role, after_start)
         if not ret and not self.is_starting():
-            self.set_state('restart failed ({0})'.format(self.state))
+            logger.warning('restart failed (%r)', self.state)
+            self.set_state(PostgresqlState.RESTART_FAILED)
         return ret
 
     def is_healthy(self) -> bool:
@@ -1033,7 +1071,7 @@ class Postgresql(object):
     def controldata(self) -> Dict[str, str]:
         """ return the contents of pg_controldata, or non-True value if pg_controldata call failed """
         # Don't try to call pg_controldata during backup restore
-        if self._version_file_exists() and self.state != 'creating replica':
+        if self._version_file_exists() and self.state != PostgresqlState.CREATING_REPLICA:
             try:
                 env = {**os.environ, 'LANG': 'C', 'LC_ALL': 'C'}
                 data = subprocess.check_output([self.pgcommand('pg_controldata'), self._data_dir], env=env)
@@ -1041,8 +1079,8 @@ class Postgresql(object):
                     data = filter(lambda e: ':' in e, data.decode('utf-8').splitlines())
                     # pg_controldata output depends on major version. Some of parameters are prefixed by 'Current '
                     return {k.replace('Current ', '', 1): v.strip() for k, v in map(lambda e: e.split(':', 1), data)}
-            except subprocess.CalledProcessError:
-                logger.exception("Error when calling pg_controldata")
+            except Exception as e:
+                logger.error("Error when calling pg_controldata: %r", e)
         return {}
 
     def waldump(self, timeline: Union[int, str], lsn: str, limit: int) -> Tuple[Optional[bytes], Optional[bytes]]:
@@ -1127,7 +1165,7 @@ class Postgresql(object):
         # and we know for sure that postgres was already running before, we will only execute on_role_change
         # callback and prevent execution of on_restart/on_start callback.
         # If the role remains the same (replica or standby_leader), we will execute on_start or on_restart
-        change_role = self.cb_called and (self.role in ('master', 'primary', 'demoted')
+        change_role = self.cb_called and (self.role in ('primary', 'demoted')
                                           or not {'standby_leader', 'replica'} - {self.role, role})
         if change_role:
             self.__cb_pending = CallbackAction.NOOP
@@ -1153,7 +1191,7 @@ class Postgresql(object):
         for _ in polling_loop(wait_seconds):
             data = self.controldata()
             if data.get('Database cluster state') == 'in production':
-                self.set_role('master')
+                self.set_role('primary')
                 return True
 
     def _pre_promote(self) -> bool:
@@ -1188,7 +1226,7 @@ class Postgresql(object):
 
     def promote(self, wait_seconds: int, task: CriticalTask,
                 before_promote: Optional[Callable[..., Any]] = None) -> Optional[bool]:
-        if self.role in ('promoted', 'master', 'primary'):
+        if self.role in ('promoted', 'primary'):
             return True
 
         ret = self._pre_promote()
@@ -1232,8 +1270,9 @@ class Postgresql(object):
             received_location = self.received_location()
             pg_control_timeline = self._cluster_info_state_get('pg_control_timeline')
         else:
-            timeline, wal_position, replayed_location, received_location, _, pg_control_timeline = \
-                self._query(self.cluster_info_query)[0][:6]
+            timeline, wal_position, replayed_location, received_location, _, pg_control_timeline, _, write_location = \
+                self._query(self.cluster_info_query)[0][:8]
+            received_location = max(received_location or 0, write_location or 0)
 
         wal_position = self._wal_position(bool(timeline), wal_position, received_location, replayed_location)
         return timeline, wal_position, pg_control_timeline

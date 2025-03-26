@@ -4,16 +4,20 @@ import json
 import socket
 import time
 import unittest
-import urllib3
+
+from threading import Thread
 from unittest import mock
-from unittest.mock import Mock, PropertyMock, mock_open, patch
+from unittest.mock import Mock, mock_open, patch, PropertyMock
+
+import urllib3
 
 from patroni.dcs import get_dcs
 from patroni.dcs.kubernetes import Cluster, k8s_client, k8s_config, K8sConfig, K8sConnectionFailed, \
-    K8sException, K8sObject, Kubernetes, KubernetesError, KubernetesRetriableException, \
-    Retry, RetryFailedError, SERVICE_HOST_ENV_NAME, SERVICE_PORT_ENV_NAME
+    K8sException, K8sObject, Kubernetes, KubernetesError, KubernetesRetriableException, Retry, \
+    RetryFailedError, SERVICE_HOST_ENV_NAME, SERVICE_PORT_ENV_NAME
+from patroni.postgresql.misc import PostgresqlState
 from patroni.postgresql.mpp import get_mpp
-from threading import Thread
+
 from . import MockResponse, SleepException
 
 
@@ -23,14 +27,16 @@ def mock_list_namespaced_config_map(*args, **kwargs):
                 'annotations': {'initialize': '123', 'config': '{}'}}
     items = [k8s_client.V1ConfigMap(metadata=k8s_client.V1ObjectMeta(**metadata))]
     metadata.update({'name': 'test-leader',
-                     'annotations': {'optime': '1234x', 'leader': 'p-0', 'ttl': '30s', 'slots': '{', 'failsafe': '{'}})
+                     'annotations': {'optime': '1234x', 'leader': 'p-0', 'ttl': '30s',
+                                     'slots': '{', 'retain_slots': '{', 'failsafe': '{'}})
     items.append(k8s_client.V1ConfigMap(metadata=k8s_client.V1ObjectMeta(**metadata)))
     metadata.update({'name': 'test-failover', 'annotations': {'leader': 'p-0'}})
     items.append(k8s_client.V1ConfigMap(metadata=k8s_client.V1ObjectMeta(**metadata)))
     metadata.update({'name': 'test-sync', 'annotations': {'leader': 'p-0'}})
     items.append(k8s_client.V1ConfigMap(metadata=k8s_client.V1ObjectMeta(**metadata)))
     metadata.update({'name': 'test-0-leader', 'labels': {k8s_group_label: '0'},
-                     'annotations': {'optime': '1234x', 'leader': 'p-0', 'ttl': '30s', 'slots': '{', 'failsafe': '{'}})
+                     'annotations': {'optime': '1234x', 'leader': 'p-0', 'ttl': '30s',
+                                     'slots': '{', 'retain_slots': '{', 'failsafe': '{'}})
     items.append(k8s_client.V1ConfigMap(metadata=k8s_client.V1ObjectMeta(**metadata)))
     metadata.update({'name': 'test-0-config', 'labels': {k8s_group_label: '0'},
                      'annotations': {'initialize': '123', 'config': '{}'}})
@@ -156,6 +162,7 @@ class TestK8sConfig(unittest.TestCase):
 
 
 @patch('urllib3.PoolManager.request')
+@patch.object(K8sConfig, '_server', '', create=True)
 class TestApiClient(unittest.TestCase):
 
     @patch.object(K8sConfig, '_server', '', create=True)
@@ -230,7 +237,8 @@ class BaseTestKubernetes(unittest.TestCase):
     @patch.object(k8s_client.CoreV1Api, 'list_namespaced_config_map', mock_list_namespaced_config_map, create=True)
     def setUp(self, config=None):
         config = {'ttl': 30, 'scope': 'test', 'name': 'p-0', 'loop_wait': 10, 'retry_timeout': 10,
-                  'kubernetes': {'labels': {'f': 'b'}, 'bypass_api_service': True, **(config or {})},
+                  'kubernetes': {'labels': {'f': 'b'}, 'bypass_api_service': True, **(config or {}),
+                                 'bootstrap_labels': {'foo': 'bar'}},
                   'citus': {'group': 0, 'database': 'postgres'}}
         self.k = get_dcs(config)
         self.assertIsInstance(self.k, Kubernetes)
@@ -312,10 +320,22 @@ class TestKubernetesConfigMaps(BaseTestKubernetes):
     @patch.object(k8s_client.CoreV1Api, 'patch_namespaced_pod', create=True)
     def test_touch_member(self, mock_patch_namespaced_pod):
         mock_patch_namespaced_pod.return_value.metadata.resource_version = '10'
-        self.k.touch_member({'role': 'replica'})
+
         self.k._name = 'p-1'
-        self.k.touch_member({'state': 'running', 'role': 'replica'})
-        self.k.touch_member({'state': 'stopped', 'role': 'primary'})
+        self.k.touch_member({'role': 'replica', 'state': PostgresqlState.INITDB})
+        self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['foo'], 'bar')
+
+        self.k.touch_member({'state': PostgresqlState.RUNNING, 'role': 'replica'})
+        self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['foo'], None)
+
+        self.k.touch_member({'role': 'replica', 'state': PostgresqlState.CUSTOM_BOOTSTRAP})
+        self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['foo'], 'bar')
+
+        self.k.touch_member({'role': 'replica', 'state': PostgresqlState.BOOTSTRAP_STARTING})
+        self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['foo'], 'bar')
+
+        self.k.touch_member({'state': PostgresqlState.STOPPED, 'role': 'primary'})
+        self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['foo'], None)
 
         self.k._role_label = 'isMaster'
         self.k._leader_label_value = 'true'
@@ -323,23 +343,26 @@ class TestKubernetesConfigMaps(BaseTestKubernetes):
         self.k._standby_leader_label_value = 'false'
         self.k._tmp_role_label = 'tmp_role'
 
-        self.k.touch_member({'state': 'running', 'role': 'replica'})
-        mock_patch_namespaced_pod.assert_called()
+        self.k.touch_member({'state': PostgresqlState.CREATING_REPLICA, 'role': 'replica'})
+        self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['foo'], 'bar')
+
+        self.k.touch_member({'state': PostgresqlState.RUNNING, 'role': 'replica'})
+        self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['foo'], None)
         self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['isMaster'], 'false')
         self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['tmp_role'], 'replica')
         mock_patch_namespaced_pod.rest_mock()
 
         self.k._name = 'p-0'
-        self.k.touch_member({'role': 'standby_leader'})
+        self.k.touch_member({'state': PostgresqlState.RUNNING, 'role': 'standby_leader'})
         mock_patch_namespaced_pod.assert_called()
         self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['isMaster'], 'false')
-        self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['tmp_role'], 'master')
+        self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['tmp_role'], 'primary')
         mock_patch_namespaced_pod.rest_mock()
 
-        self.k.touch_member({'role': 'primary'})
+        self.k.touch_member({'state': PostgresqlState.RUNNING, 'role': 'primary'})
         mock_patch_namespaced_pod.assert_called()
         self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['isMaster'], 'true')
-        self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['tmp_role'], 'master')
+        self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['tmp_role'], 'primary')
 
     def test_initialize(self):
         self.k.initialize()
@@ -383,8 +406,7 @@ class TestKubernetesEndpointsNoPodIP(BaseTestKubernetes):
 
     @patch.object(k8s_client.CoreV1Api, 'patch_namespaced_endpoints', create=True)
     def test_update_leader(self, mock_patch_namespaced_endpoints):
-        leader = self.k.get_cluster().leader
-        self.assertIsNotNone(self.k.update_leader(leader, '123', failsafe={'foo': 'bar'}))
+        self.assertIsNotNone(self.k.update_leader(self.k.get_cluster(), '123', failsafe={'foo': 'bar'}))
         args = mock_patch_namespaced_endpoints.call_args[0]
         self.assertEqual(args[2].subsets[0].addresses[0].target_ref.resource_version, '1')
         self.assertEqual(args[2].subsets[0].addresses[0].ip, '10.0.0.1')
@@ -399,38 +421,43 @@ class TestKubernetesEndpoints(BaseTestKubernetes):
 
     @patch.object(k8s_client.CoreV1Api, 'patch_namespaced_endpoints', create=True)
     def test_update_leader(self, mock_patch_namespaced_endpoints):
-        leader = self.k.get_cluster().leader
-        self.assertIsNotNone(self.k.update_leader(leader, '123', failsafe={'foo': 'bar'}))
+        cluster = self.k.get_cluster()
+        self.assertIsNotNone(self.k.update_leader(cluster, '123', failsafe={'foo': 'bar'}))
         args = mock_patch_namespaced_endpoints.call_args[0]
         self.assertEqual(args[2].subsets[0].addresses[0].target_ref.resource_version, '10')
         self.assertEqual(args[2].subsets[0].addresses[0].ip, '10.0.0.0')
         self.k._kinds._object_cache['test'].subsets[:] = []
-        self.assertIsNotNone(self.k.update_leader(leader, '123'))
+        self.assertIsNotNone(self.k.update_leader(cluster, '123'))
         self.k._kinds._object_cache['test'].metadata.annotations['leader'] = 'p-1'
-        self.assertFalse(self.k.update_leader(leader, '123'))
+        self.assertFalse(self.k.update_leader(cluster, '123'))
 
     @patch.object(k8s_client.CoreV1Api, 'read_namespaced_endpoints', create=True)
     @patch.object(k8s_client.CoreV1Api, 'patch_namespaced_endpoints', create=True)
     def test__update_leader_with_retry(self, mock_patch, mock_read):
-        leader = self.k.get_cluster().leader
+        cluster = self.k.get_cluster()
         mock_read.return_value = mock_read_namespaced_endpoints()
         mock_patch.side_effect = k8s_client.rest.ApiException(502, '')
-        self.assertFalse(self.k.update_leader(leader, '123'))
+        self.assertFalse(self.k.update_leader(cluster, '123'))
         mock_patch.side_effect = RetryFailedError('')
-        self.assertRaises(KubernetesError, self.k.update_leader, leader, '123')
-        mock_patch.side_effect = k8s_client.rest.ApiException(409, '')
-        with patch('time.time', Mock(side_effect=[0, 100, 200, 0, 0, 0, 0, 100, 200])):
-            self.assertFalse(self.k.update_leader(leader, '123'))
-            self.assertFalse(self.k.update_leader(leader, '123'))
-        self.assertFalse(self.k.update_leader(leader, '123'))
-        mock_patch.side_effect = [k8s_client.rest.ApiException(409, ''), mock_namespaced_kind()]
+        self.assertRaises(KubernetesError, self.k.update_leader, cluster, '123')
+        mock_patch.side_effect = [k8s_client.rest.ApiException(409, ''),
+                                  k8s_client.rest.ApiException(409, ''), mock_namespaced_kind()]
         mock_read.return_value.metadata.resource_version = '2'
-        self.assertIsNotNone(self.k._update_leader_with_retry({}, '1', []))
+        mock_time = Mock(side_effect=[0, 0, 100, 200, 0, 0, 0, 0, 0, 100, 200])
+        with patch('time.time', mock_time), patch('time.time_ns', mock_time, create=True):
+            self.assertFalse(self.k.update_leader(cluster, '123'))
+            self.assertFalse(self.k.update_leader(cluster, '123'))
+        mock_patch.side_effect = k8s_client.rest.ApiException(409, '')
+        self.assertFalse(self.k.update_leader(cluster, '123'))
+        mock_patch.side_effect = [k8s_client.rest.ApiException(409, ''), mock_namespaced_kind()]
+        self.assertTrue(self.k._update_leader_with_retry({}, '1', []))
+        mock_patch.side_effect = [k8s_client.rest.ApiException(409, ''), mock_namespaced_kind()]
+        self.assertIsNotNone(self.k._update_leader_with_retry({'foo': 'bar'}, '1', []))
         mock_patch.side_effect = k8s_client.rest.ApiException(409, '')
         mock_read.side_effect = RetryFailedError('')
-        self.assertRaises(KubernetesError, self.k.update_leader, leader, '123')
+        self.assertRaises(KubernetesError, self.k.update_leader, cluster, '123')
         mock_read.side_effect = Exception
-        self.assertFalse(self.k.update_leader(leader, '123'))
+        self.assertFalse(self.k.update_leader(cluster, '123'))
 
     @patch.object(k8s_client.CoreV1Api, 'patch_namespaced_endpoints',
                   Mock(side_effect=[k8s_client.rest.ApiException(500, ''),
@@ -440,7 +467,7 @@ class TestKubernetesEndpoints(BaseTestKubernetes):
 
     @patch.object(k8s_client.CoreV1Api, 'patch_namespaced_endpoints', mock_namespaced_kind, create=True)
     def test_write_sync_state(self):
-        self.assertIsNotNone(self.k.write_sync_state('a', ['b'], 1))
+        self.assertIsNotNone(self.k.write_sync_state('a', ['b'], 0, 1))
 
     @patch.object(k8s_client.CoreV1Api, 'patch_namespaced_pod', mock_namespaced_kind, create=True)
     @patch.object(k8s_client.CoreV1Api, 'create_namespaced_endpoints', mock_namespaced_kind, create=True)
@@ -468,7 +495,7 @@ class TestKubernetesEndpoints(BaseTestKubernetes):
         self.assertEqual(('create_config_service failed',), mock_logger_exception.call_args[0])
         mock_logger_exception.reset_mock()
 
-        self.k.touch_member({'state': 'running', 'role': 'replica'})
+        self.k.touch_member({'state': PostgresqlState.RUNNING, 'role': 'replica'})
         mock_logger_exception.assert_called_once()
         self.assertEqual(('create_config_service failed',), mock_logger_exception.call_args[0])
 

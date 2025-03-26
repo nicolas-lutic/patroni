@@ -1,13 +1,15 @@
 import datetime
 import os
-import psutil
 import re
 import subprocess
 import time
 
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import Mock, MagicMock, PropertyMock, patch, mock_open
+from threading import current_thread, Thread
+from unittest.mock import MagicMock, Mock, mock_open, patch, PropertyMock
+
+import psutil
 
 import patroni.psycopg as psycopg
 
@@ -15,22 +17,21 @@ from patroni import global_config
 from patroni.async_executor import CriticalTask
 from patroni.collections import CaseInsensitiveDict, CaseInsensitiveSet
 from patroni.dcs import RemoteMember
-from patroni.exceptions import PostgresConnectionException, PatroniException
-from patroni.postgresql import Postgresql, STATE_REJECT, STATE_NO_RESPONSE
+from patroni.exceptions import PatroniException, PostgresConnectionException
+from patroni.postgresql import PgIsReadyStatus, Postgresql
 from patroni.postgresql.bootstrap import Bootstrap
 from patroni.postgresql.callback_executor import CallbackAction
-from patroni.postgresql.config import get_param_diff, _false_validator
+from patroni.postgresql.config import _false_validator, get_param_diff
+from patroni.postgresql.misc import PostgresqlState
 from patroni.postgresql.postmaster import PostmasterProcess
-from patroni.postgresql.validator import (ValidatorFactoryNoType, ValidatorFactoryInvalidType,
-                                          ValidatorFactoryInvalidSpec, ValidatorFactory, InvalidGucValidatorsFile,
-                                          _get_postgres_guc_validators, _read_postgres_gucs_validators_file,
-                                          _load_postgres_gucs_validators, Bool, Integer, Real, Enum, EnumBool, String)
+from patroni.postgresql.validator import _get_postgres_guc_validators, _load_postgres_gucs_validators, \
+    _read_postgres_gucs_validators_file, Bool, Enum, EnumBool, Integer, InvalidGucValidatorsFile, \
+    Real, String, transform_postgresql_parameter_value, ValidatorFactory, ValidatorFactoryInvalidSpec, \
+    ValidatorFactoryInvalidType, ValidatorFactoryNoType
 from patroni.utils import RetryFailedError
-from threading import Thread, current_thread
 
-from . import (BaseTestPostgresql, MockCursor, MockPostmaster, psycopg_connect, mock_available_gucs,
-               GET_PG_SETTINGS_RESULT)
-
+from . import BaseTestPostgresql, GET_PG_SETTINGS_RESULT, \
+    mock_available_gucs, MockCursor, MockPostmaster, psycopg_connect
 
 mtime_ret = {}
 
@@ -99,6 +100,7 @@ Data page checksum version:           0
 
 
 @patch('subprocess.call', Mock(return_value=0))
+@patch('subprocess.check_output', Mock(return_value=b"postgres (PostgreSQL) 12.1"))
 @patch('patroni.psycopg.connect', psycopg_connect)
 @patch.object(Postgresql, 'available_gucs', mock_available_gucs)
 class TestPostgresql(BaseTestPostgresql):
@@ -158,7 +160,7 @@ class TestPostgresql(BaseTestPostgresql):
     @patch.object(Postgresql, 'pg_isready')
     @patch('patroni.postgresql.polling_loop', Mock(return_value=range(1)))
     def test_wait_for_port_open(self, mock_pg_isready):
-        mock_pg_isready.return_value = STATE_NO_RESPONSE
+        mock_pg_isready.return_value = PgIsReadyStatus.NO_RESPONSE
         mock_postmaster = MockPostmaster()
         mock_postmaster.is_running.return_value = None
 
@@ -256,7 +258,7 @@ class TestPostgresql(BaseTestPostgresql):
     def test_restart(self):
         self.p.start = Mock(return_value=False)
         self.assertFalse(self.p.restart())
-        self.assertEqual(self.p.state, 'restart failed (restarting)')
+        self.assertEqual(self.p.state, PostgresqlState.RESTART_FAILED)
 
     @patch('os.chmod', Mock())
     @patch('builtins.open', MagicMock())
@@ -264,12 +266,16 @@ class TestPostgresql(BaseTestPostgresql):
         self.p.config.write_pgpass({'host': 'localhost', 'port': '5432', 'user': 'foo'})
         self.p.config.write_pgpass({'host': 'localhost', 'port': '5432', 'user': 'foo', 'password': 'bar'})
 
+    def test__pgpass_content(self):
+        pgpass = self.p.config._pgpass_content({'host': '/tmp', 'port': '5432', 'user': 'foo', 'password': 'bar'})
+        self.assertEqual(pgpass, "/tmp:5432:*:foo:bar\nlocalhost:5432:*:foo:bar\n")
+
     def test_checkpoint(self):
         with patch.object(MockCursor, 'fetchone', Mock(return_value=(True, ))):
             self.assertEqual(self.p.checkpoint({'user': 'postgres'}), 'is_in_recovery=true')
         with patch.object(MockCursor, 'execute', Mock(return_value=None)):
             self.assertIsNone(self.p.checkpoint())
-        self.assertEqual(self.p.checkpoint(timeout=10), 'not accessible or not healty')
+        self.assertEqual(self.p.checkpoint(timeout=10), 'not accessible or not healthy')
 
     @patch('patroni.postgresql.config.mtime', mock_mtime)
     @patch('patroni.postgresql.config.ConfigHandler._get_pg_settings')
@@ -362,6 +368,7 @@ class TestPostgresql(BaseTestPostgresql):
 
     @patch.object(Postgresql, 'is_running', Mock(return_value=False))
     @patch.object(Postgresql, 'start', Mock())
+    @patch.object(Postgresql, 'major_version', PropertyMock(return_value=170000))
     def test_follow(self):
         self.p.call_nowait(CallbackAction.ON_START)
         m = RemoteMember('1', {'restore_command': '2', 'primary_slot_name': 'foo', 'conn_kwargs': {'host': 'foo,bar'}})
@@ -372,7 +379,7 @@ class TestPostgresql(BaseTestPostgresql):
     @patch.object(MockCursor, 'execute', Mock(side_effect=psycopg.OperationalError))
     def test__query(self):
         self.assertRaises(PostgresConnectionException, self.p._query, 'blabla')
-        self.p._state = 'restarting'
+        self.p._state = PostgresqlState.RESTARTING
         self.assertRaises(RetryFailedError, self.p._query, 'blabla')
 
     def test_query(self):
@@ -380,7 +387,7 @@ class TestPostgresql(BaseTestPostgresql):
         self.assertRaises(PostgresConnectionException, self.p.query, 'RetryFailedError')
         self.assertRaises(psycopg.ProgrammingError, self.p.query, 'blabla')
 
-    @patch.object(Postgresql, 'pg_isready', Mock(return_value=STATE_REJECT))
+    @patch.object(Postgresql, 'pg_isready', Mock(return_value=PgIsReadyStatus.REJECT))
     def test_is_primary(self):
         self.assertTrue(self.p.is_primary())
         self.p.reset_cluster_info_state(None)
@@ -531,9 +538,16 @@ class TestPostgresql(BaseTestPostgresql):
             self.assertEqual(self.p.controldata(), {})
 
     @patch('patroni.postgresql.Postgresql._version_file_exists', Mock(return_value=True))
-    @patch('subprocess.check_output', MagicMock(return_value=0, side_effect=pg_controldata_string))
     def test_sysid(self):
-        self.assertEqual(self.p.sysid, "6200971513092291716")
+        with patch('subprocess.check_output', Mock(return_value=0, side_effect=pg_controldata_string)):
+            self.assertEqual(self.p.sysid, "6200971513092291716")
+
+    def test_pg_version(self):
+        self.assertEqual(self.p.config.pg_version, 99999)  # server_version
+        with patch.object(Postgresql, 'server_version', PropertyMock(side_effect=AttributeError)):
+            self.assertEqual(self.p.config.pg_version, 140000)  # PG_VERSION==14, postgres --version == 12.1
+            with patch('subprocess.check_output', Mock(return_value=b"postgres (PostgreSQL) 14.1")):
+                self.assertEqual(self.p.config.pg_version, 140001)
 
     @patch('os.path.isfile', Mock(return_value=True))
     @patch('shutil.copy', Mock(side_effect=IOError))
@@ -731,33 +745,33 @@ class TestPostgresql(BaseTestPostgresql):
 
     def test_check_for_startup(self):
         with patch('subprocess.call', return_value=0):
-            self.p._state = 'starting'
+            self.p._state = PostgresqlState.STARTING
             self.assertFalse(self.p.check_for_startup())
-            self.assertEqual(self.p.state, 'running')
+            self.assertEqual(self.p.state, PostgresqlState.RUNNING)
 
         with patch('subprocess.call', return_value=1):
-            self.p._state = 'starting'
+            self.p._state = PostgresqlState.STARTING
             self.assertTrue(self.p.check_for_startup())
-            self.assertEqual(self.p.state, 'starting')
+            self.assertEqual(self.p.state, PostgresqlState.STARTING)
 
         with patch('subprocess.call', return_value=2):
-            self.p._state = 'starting'
+            self.p._state = PostgresqlState.STARTING
             self.assertFalse(self.p.check_for_startup())
-            self.assertEqual(self.p.state, 'start failed')
+            self.assertEqual(self.p.state, PostgresqlState.START_FAILED)
 
         with patch('subprocess.call', return_value=0):
-            self.p._state = 'running'
+            self.p._state = PostgresqlState.RUNNING
             self.assertFalse(self.p.check_for_startup())
-            self.assertEqual(self.p.state, 'running')
+            self.assertEqual(self.p.state, PostgresqlState.RUNNING)
 
         with patch('subprocess.call', return_value=127):
-            self.p._state = 'running'
+            self.p._state = PostgresqlState.RUNNING
             self.assertFalse(self.p.check_for_startup())
-            self.assertEqual(self.p.state, 'running')
+            self.assertEqual(self.p.state, PostgresqlState.RUNNING)
 
-            self.p._state = 'starting'
+            self.p._state = PostgresqlState.STARTING
             self.assertFalse(self.p.check_for_startup())
-            self.assertEqual(self.p.state, 'running')
+            self.assertEqual(self.p.state, PostgresqlState.RUNNING)
 
     def test_wait_for_startup(self):
         state = {'sleeps': 0, 'num_rejects': 0, 'final_return': 0}
@@ -780,21 +794,21 @@ class TestPostgresql(BaseTestPostgresql):
             with patch('time.sleep', side_effect=increment_sleeps):
                 self.p.time_in_state = Mock(side_effect=time_in_state)
 
-                self.p._state = 'stopped'
+                self.p._state = PostgresqlState.STOPPED
                 self.assertTrue(self.p.wait_for_startup())
                 self.assertEqual(state['sleeps'], 0)
 
-                self.p._state = 'starting'
+                self.p._state = PostgresqlState.STARTING
                 state['num_rejects'] = 5
                 self.assertTrue(self.p.wait_for_startup())
                 self.assertEqual(state['sleeps'], 5)
 
-                self.p._state = 'starting'
+                self.p._state = PostgresqlState.STARTING
                 state['sleeps'] = 0
                 state['final_return'] = 2
                 self.assertFalse(self.p.wait_for_startup())
 
-                self.p._state = 'starting'
+                self.p._state = PostgresqlState.STARTING
                 state['sleeps'] = 0
                 state['final_return'] = 0
                 self.assertFalse(self.p.wait_for_startup(timeout=2))
@@ -802,7 +816,7 @@ class TestPostgresql(BaseTestPostgresql):
 
         with patch.object(Postgresql, 'check_startup_state_changed', Mock(return_value=False)):
             self.p.cancellable.cancel()
-            self.p._state = 'starting'
+            self.p._state = PostgresqlState.STARTING
             self.assertIsNone(self.p.wait_for_startup())
 
     def test_get_server_parameters(self):
@@ -896,6 +910,33 @@ class TestPostgresql(BaseTestPostgresql):
     @patch.object(Postgresql, '_cluster_info_state_get', Mock(return_value=True))
     def test_handle_parameter_change(self):
         self.p.handle_parameter_change()
+
+    @patch('patroni.postgresql.validator.logger.warning')
+    def test_transform_postgresql_parameter_value(self, mock_warning):
+        not_none_values = (
+            ('foo.bar', 'foo', 160003),  # name, value, version
+            ("allow_in_place_tablespaces", 'true', 130008),
+            ("restrict_nonsystem_relation_kind", 'view', 160005),
+            ('fork_specific_param', 'no_validation_file', 170001),
+        )
+        for i in not_none_values:
+            self.assertIsNotNone(
+                transform_postgresql_parameter_value(i[2], i[0], i[1], mock_available_gucs.return_value)
+            )
+
+        none_values = (
+            ("archive_cleanup_command", 'foo', 160003, False),  # name, value, version, unexpected param
+            ("allow_in_place_tablespaces", 'true', 130005, True),
+            ("restrict_nonsystem_relation_kind", 'view', 160001, True),
+        )
+        for i in none_values:
+            self.assertIsNone(
+                transform_postgresql_parameter_value(i[2], i[0], i[1], mock_available_gucs.return_value)
+            )
+            if i[3]:
+                mock_warning.assert_called_once_with(
+                    'Removing unexpected parameter=%s value=%s from the config', i[0], i[1])
+            mock_warning.reset_mock()
 
     def test_validator_factory(self):
         # validator with no type
@@ -1077,7 +1118,8 @@ class TestPostgresql(BaseTestPostgresql):
         file1_attrs = {'is_file.return_value': True, 'is_dir.return_value': False}
         file1_mock = MagicMock(**file1_attrs)
         file1_mock.name = '__init__.py'
-        file2_attrs = {'is_file.return_value': False, 'is_dir.return_value': True, 'iterdir.return_value': []}
+        file2_attrs = {'is_file.return_value': False, 'is_dir.return_value': True,
+                       'iterdir.side_effect': PermissionError(13, 'Permission denied')}
         file2_mock = MagicMock(**file2_attrs)
         file2_mock.name = '__pycache__'
         file3_attrs = {'is_file.return_value': True, 'is_dir.return_value': False}
@@ -1091,9 +1133,11 @@ class TestPostgresql(BaseTestPostgresql):
         dir_mock = MagicMock(**dir_attrs)
         dir_mock.iterdir.return_value = [file1_mock, file2_mock, file3_mock, file4_mock]
         with patch('patroni.postgresql.available_parameters.conf_dir', dir_mock), \
+             patch('patroni.postgresql.available_parameters.logger.debug') as mock_debug, \
              patch('patroni.postgresql.available_parameters.logger.info') as mock_info, \
              patch('patroni.postgresql.validator.logger.warning') as mock_warning:
             _load_postgres_gucs_validators()
+            self.assertEqual(mock_debug.call_args[0][0], "Can't list directory %s: %r")
             mock_info.assert_called_once_with('Ignored a non-YAML file found under `%s` '
                                               'directory: `%s`.', 'available_parameters', file4_mock)
             mock_warning.assert_called_once()
@@ -1137,5 +1181,28 @@ class TestPostgresql2(BaseTestPostgresql):
         self.p.config.load_current_server_parameters()
         self.assertTrue(all(self.p.config._server_parameters[name] == value for name, value in keep_values.items()))
         self.assertEqual(dict(self.p.config._recovery_params),
-                         {'primary_conninfo': {'host': 'a', 'port': '5433', 'passfile': '/blabla',
-                          'gssencmode': 'prefer', 'sslmode': 'prefer', 'channel_binding': 'prefer'}})
+                         {'primary_conninfo': {'host': 'a', 'port': '5433', 'passfile': '/blabla', 'sslmode': 'prefer',
+                          'gssencmode': 'prefer', 'channel_binding': 'prefer', 'sslnegotiation': 'postgres'}})
+
+    def test_format_dsn(self):
+        params = {'host': '1', 'port': 2, 'target_session_attrs': 'read-write', 'gssencmode': 'prefer',
+                  'channel_binding': 'prefer', 'sslpassword': 'pwd', 'sslcrldir': '/', 'sslnegotiation': 'postgres'}
+        self.p._major_version = 90600
+        self.assertEqual(self.p.config.format_dsn(params), 'host=1 port=2')
+        self.p._major_version = 100000
+        self.assertEqual(self.p.config.format_dsn(params), 'host=1 port=2 target_session_attrs=read-write')
+        self.p._major_version = 120000
+        self.assertEqual(self.p.config.format_dsn(params),
+                         'host=1 port=2 gssencmode=prefer target_session_attrs=read-write')
+        self.p._major_version = 130000
+        self.assertEqual(self.p.config.format_dsn(params),
+                         'host=1 port=2 sslpassword=pwd gssencmode=prefer '
+                         'channel_binding=prefer target_session_attrs=read-write')
+        self.p._major_version = 140000
+        self.assertEqual(self.p.config.format_dsn(params),
+                         'host=1 port=2 sslpassword=pwd sslcrldir=/ gssencmode=prefer '
+                         'channel_binding=prefer target_session_attrs=read-write')
+        self.p._major_version = 170000
+        self.assertEqual(self.p.config.format_dsn(params),
+                         'host=1 port=2 sslpassword=pwd sslcrldir=/ gssencmode=prefer channel_binding=prefer '
+                         'target_session_attrs=read-write sslnegotiation=postgres')

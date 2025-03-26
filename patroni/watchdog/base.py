@@ -2,8 +2,8 @@ import abc
 import logging
 import platform
 import sys
-from threading import RLock
 
+from threading import RLock
 from typing import Any, Callable, Dict, Optional, Union
 
 from ..config import Config
@@ -140,7 +140,8 @@ class Watchdog(object):
             self.impl.open()
             actual_timeout = self._set_timeout()
         except WatchdogError as e:
-            logger.warning("Could not activate %s: %s", self.impl.describe(), e)
+            log = logger.warning if self.config.mode == MODE_REQUIRED else logger.debug
+            log("Could not activate %s: %s", self.impl.describe(), e)
             self.impl = NullWatchdog()
             actual_timeout = self.impl.get_timeout()
 

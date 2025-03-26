@@ -21,13 +21,13 @@ import subprocess
 import sys
 import tempfile
 import time
-from shlex import split
-
-from typing import Any, Callable, Dict, Iterator, List, Optional, Union, Tuple, Type, TYPE_CHECKING
 
 from collections import OrderedDict
-from dateutil import tz
 from json import JSONDecoder
+from shlex import split
+from typing import Any, Callable, cast, Dict, Iterator, List, Optional, Tuple, Type, TYPE_CHECKING, Union
+
+from dateutil import tz
 from urllib3.response import HTTPResponse
 
 from .exceptions import PatroniException
@@ -79,7 +79,7 @@ def get_conversion_table(base_unit: str) -> Dict[str, Dict[str, Union[int, float
     return OrderedDict()
 
 
-def deep_compare(obj1: Dict[Any, Union[Any, Dict[Any, Any]]], obj2: Dict[Any, Union[Any, Dict[Any, Any]]]) -> bool:
+def deep_compare(obj1: Dict[Any, Any], obj2: Dict[Any, Any]) -> bool:
     """Recursively compare two dictionaries to check if they are equal in terms of keys and values.
 
     .. note::
@@ -112,14 +112,14 @@ def deep_compare(obj1: Dict[Any, Union[Any, Dict[Any, Any]]], obj2: Dict[Any, Un
 
     for key, value in obj1.items():
         if isinstance(value, dict):
-            if not (isinstance(obj2[key], dict) and deep_compare(value, obj2[key])):
+            if not (isinstance(obj2[key], dict) and deep_compare(cast(Dict[Any, Any], value), obj2[key])):
                 return False
         elif str(value) != str(obj2[key]):
             return False
     return True
 
 
-def patch_config(config: Dict[Any, Union[Any, Dict[Any, Any]]], data: Dict[Any, Union[Any, Dict[Any, Any]]]) -> bool:
+def patch_config(config: Dict[Any, Any], data: Dict[Any, Any]) -> bool:
     """Update and append to dictionary *config* from overrides in *data*.
 
     .. note::
@@ -142,7 +142,7 @@ def patch_config(config: Dict[Any, Union[Any, Dict[Any, Any]]], data: Dict[Any, 
         elif name in config:
             if isinstance(value, dict):
                 if isinstance(config[name], dict):
-                    if patch_config(config[name], value):
+                    if patch_config(config[name], cast(Dict[Any, Any], value)):
                         is_changed = True
                 else:
                     config[name] = value
@@ -156,7 +156,7 @@ def patch_config(config: Dict[Any, Union[Any, Dict[Any, Any]]], data: Dict[Any, 
     return is_changed
 
 
-def parse_bool(value: Any) -> Union[bool, None]:
+def parse_bool(value: Any) -> Optional[bool]:
     """Parse a given value to a :class:`bool` object.
 
     .. note::
@@ -186,7 +186,7 @@ def parse_bool(value: Any) -> Union[bool, None]:
         return False
 
 
-def strtol(value: Any, strict: Optional[bool] = True) -> Tuple[Union[int, None], str]:
+def strtol(value: Any, strict: Optional[bool] = True) -> Tuple[Optional[int], str]:
     """Extract the long integer part from the beginning of a string that represents a configuration value.
 
     As most as possible close equivalent of ``strtol(3)`` C function (with base=0), which is used by postgres to parse
@@ -240,7 +240,7 @@ def strtol(value: Any, strict: Optional[bool] = True) -> Tuple[Union[int, None],
     return (None if strict else 1), value
 
 
-def strtod(value: Any) -> Tuple[Union[float, None], str]:
+def strtod(value: Any) -> Tuple[Optional[float], str]:
     """Extract the double precision part from the beginning of a string that reprensents a configuration value.
 
     As most as possible close equivalent of ``strtod(3)`` C function, which is used by postgres to parse parameter
@@ -922,10 +922,8 @@ def cluster_as_json(cluster: 'Cluster') -> Dict[str, Any]:
         * ``members``: list of members in the cluster. Each value is a :class:`dict` that may have the following keys:
 
             * ``name``: the name of the host (unique in the cluster). The ``members`` list is sorted by this key;
-            * ``role``: ``leader``, ``standby_leader``, ``sync_standby``, or ``replica``;
-            * ``state``: ``stopping``, ``stopped``, ``stop failed``, ``crashed``, ``running``, ``starting``,
-                ``start failed``, ``restarting``, ``restart failed``, ``initializing new cluster``, ``initdb failed``,
-                ``running custom bootstrap script``, ``custom bootstrap failed``, or ``creating replica``;
+            * ``role``: ``leader``, ``standby_leader``, ``sync_standby``, ``quorum_standby``, or ``replica``;
+            * ``state``: one of :class:`~patroni.postgresql.misc.PostgresqlState`;
             * ``api_url``: REST API URL based on ``restapi->connect_address`` configuration;
             * ``host``: PostgreSQL host based on ``postgresql->connect_address``;
             * ``port``: PostgreSQL port based on ``postgresql->connect_address``;
@@ -946,14 +944,15 @@ def cluster_as_json(cluster: 'Cluster') -> Dict[str, Any]:
 
     config = global_config.from_cluster(cluster)
     leader_name = cluster.leader.name if cluster.leader else None
-    cluster_lsn = cluster.last_lsn or 0
+    cluster_lsn = cluster.status.last_lsn
 
     ret: Dict[str, Any] = {'members': []}
+    sync_role = 'quorum_standby' if config.is_quorum_commit_mode else 'sync_standby'
     for m in cluster.members:
         if m.name == leader_name:
             role = 'standby_leader' if config.is_standby_cluster else 'leader'
         elif config.is_synchronous_mode and cluster.sync.matches(m.name):
-            role = 'sync_standby'
+            role = sync_role
         else:
             role = 'replica'
 
@@ -1063,6 +1062,33 @@ def data_directory_is_empty(data_dir: str) -> bool:
     return all(os.name != 'nt' and (n.startswith('.') or n == 'lost+found') for n in os.listdir(data_dir))
 
 
+def apply_keepalive_limit(option: str, value: int) -> int:
+    """
+    Ensures provided *value* for keepalive *option* does not exceed the maximum allowed value for the current platform.
+
+    :param option: The TCP keepalive option name. Possible values are:
+
+            * ``TCP_USER_TIMEOUT``;
+            * ``TCP_KEEPIDLE``;
+            * ``TCP_KEEPINTVL``;
+            * ``TCP_KEEPCNT``.
+
+    :param value: The desired value for the keepalive option.
+
+    :returns: maybe adjusted value.
+    """
+    max_of_options = {
+        'linux': {'TCP_USER_TIMEOUT': 2147483647, 'TCP_KEEPIDLE': 32767, 'TCP_KEEPINTVL': 32767, 'TCP_KEEPCNT': 127},
+        'darwin': {'TCP_KEEPIDLE': 4294967, 'TCP_KEEPINTVL': 4294967, 'TCP_KEEPCNT': 2147483647},
+    }
+    platform = 'linux' if sys.platform.startswith('linux') else sys.platform
+    max_possible_value = max_of_options.get(platform, {}).get(option)
+    if max_possible_value is not None and value > max_possible_value:
+        logger.debug('%s changed from %d to %d.', option, value, max_possible_value)
+        value = max_possible_value
+    return value
+
+
 def keepalive_intvl(timeout: int, idle: int, cnt: int = 3) -> int:
     """Calculate the value to be used as ``TCP_KEEPINTVL`` based on *timeout*, *idle*, and *cnt*.
 
@@ -1072,7 +1098,8 @@ def keepalive_intvl(timeout: int, idle: int, cnt: int = 3) -> int:
 
     :returns: the value to be used as ``TCP_KEEPINTVL``.
     """
-    return max(1, int(float(timeout - idle) / cnt))
+    intvl = max(1, int(float(timeout - idle) / cnt))
+    return apply_keepalive_limit('TCP_KEEPINTVL', intvl)
 
 
 def keepalive_socket_options(timeout: int, idle: int, cnt: int = 3) -> Iterator[Tuple[int, int, int]]:
@@ -1104,13 +1131,14 @@ def keepalive_socket_options(timeout: int, idle: int, cnt: int = 3) -> Iterator[
     if not (sys.platform.startswith('linux') or sys.platform.startswith('darwin')):
         return
 
-    if sys.platform.startswith('linux'):
-        yield (socket.SOL_TCP, 18, int(timeout * 1000))  # TCP_USER_TIMEOUT
-
+    TCP_USER_TIMEOUT = getattr(socket, 'TCP_USER_TIMEOUT', None)
+    if TCP_USER_TIMEOUT is not None:
+        yield (socket.SOL_TCP, TCP_USER_TIMEOUT, apply_keepalive_limit('TCP_USER_TIMEOUT', int(timeout * 1000)))
     # The socket constants from MacOS netinet/tcp.h are not exported by python's
     # socket module, therefore we are using 0x10, 0x101, 0x102 constants.
     TCP_KEEPIDLE = getattr(socket, 'TCP_KEEPIDLE', 0x10 if sys.platform.startswith('darwin') else None)
     if TCP_KEEPIDLE is not None:
+        idle = apply_keepalive_limit('TCP_KEEPIDLE', idle)
         yield (socket.IPPROTO_TCP, TCP_KEEPIDLE, idle)
     TCP_KEEPINTVL = getattr(socket, 'TCP_KEEPINTVL', 0x101 if sys.platform.startswith('darwin') else None)
     if TCP_KEEPINTVL is not None:
@@ -1118,6 +1146,7 @@ def keepalive_socket_options(timeout: int, idle: int, cnt: int = 3) -> Iterator[
         yield (socket.IPPROTO_TCP, TCP_KEEPINTVL, intvl)
     TCP_KEEPCNT = getattr(socket, 'TCP_KEEPCNT', 0x102 if sys.platform.startswith('darwin') else None)
     if TCP_KEEPCNT is not None:
+        cnt = apply_keepalive_limit('TCP_KEEPCNT', cnt)
         yield (socket.IPPROTO_TCP, TCP_KEEPCNT, cnt)
 
 
@@ -1179,10 +1208,48 @@ def unquote(string: str) -> str:
     return ret
 
 
+def get_postgres_version(bin_dir: Optional[str] = None, bin_name: str = 'postgres') -> str:
+    """Get full PostgreSQL version.
+
+    It is based on the output of ``postgres --version``.
+
+    :param bin_dir: path to the PostgreSQL binaries directory. If ``None`` or an empty string, it will use the first
+                    *bin_name* binary that is found by the subprocess in the ``PATH``.
+    :param bin_name: name of the postgres binary to call (``postgres`` by default)
+
+    :returns: the PostgreSQL version.
+
+    :raises:
+        :exc:`~patroni.exceptions.PatroniException`: if the postgres binary call failed due to :exc:`OSError`.
+
+    :Example:
+
+        * Returns `9.6.24` for PostgreSQL 9.6.24
+        * Returns `15.2` for PostgreSQL 15.2
+    """
+    if not bin_dir:
+        binary = bin_name
+    else:
+        binary = os.path.join(bin_dir, bin_name)
+    try:
+        version = subprocess.check_output([binary, '--version']).decode()
+    except OSError as e:
+        raise PatroniException(f'Failed to get postgres version: {e}')
+    version = re.match(r'^[^\s]+ [^\s]+ ((\d+)(\.\d+)*)', version)
+    if TYPE_CHECKING:  # pragma: no cover
+        assert version is not None
+    version = version.groups()  # e.g., ('15.2', '15', '.2')
+    major_version = int(version[1])
+    dot_count = version[0].count('.')
+    if major_version < 10 and dot_count < 2 or major_version >= 10 and dot_count < 1:
+        return '.'.join((version[0], '0'))
+    return version[0]
+
+
 def get_major_version(bin_dir: Optional[str] = None, bin_name: str = 'postgres') -> str:
     """Get the major version of PostgreSQL.
 
-    It is based on the output of ``postgres --version``.
+    Like func:`get_postgres_version` but without minor version.
 
     :param bin_dir: path to the PostgreSQL binaries directory. If ``None`` or an empty string, it will use the first
                     *bin_name* binary that is found by the subprocess in the ``PATH``.
@@ -1198,15 +1265,5 @@ def get_major_version(bin_dir: Optional[str] = None, bin_name: str = 'postgres')
         * Returns `9.6` for PostgreSQL 9.6.24
         * Returns `15` for PostgreSQL 15.2
     """
-    if not bin_dir:
-        binary = bin_name
-    else:
-        binary = os.path.join(bin_dir, bin_name)
-    try:
-        version = subprocess.check_output([binary, '--version']).decode()
-    except OSError as e:
-        raise PatroniException(f'Failed to get postgres version: {e}')
-    version = re.match(r'^[^\s]+ [^\s]+ (\d+)(\.(\d+))?', version)
-    if TYPE_CHECKING:  # pragma: no cover
-        assert version is not None
-    return '.'.join([version.group(1), version.group(3)]) if int(version.group(1)) < 10 else version.group(1)
+    full_version = get_postgres_version(bin_dir, bin_name)
+    return re.sub(r'\.\d+$', '', full_version)

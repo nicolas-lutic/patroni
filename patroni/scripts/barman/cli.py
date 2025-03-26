@@ -9,10 +9,11 @@ builds the CLI that makes an interface with the actual commands.
     See :class:ExitCode` for possible exit codes of this main script.
 """
 
-from argparse import ArgumentParser
-from enum import IntEnum
 import logging
 import sys
+
+from argparse import ArgumentParser
+from enum import IntEnum
 
 from .config_switch import run_barman_config_switch
 from .recover import run_barman_recover
@@ -170,8 +171,7 @@ def main() -> None:
     config_switch_parser.add_argument(
         "role",
         type=str,
-        choices=["master", "primary", "promoted", "standby_leader", "replica",
-                 "demoted"],
+        choices=["primary", "promoted", "standby_leader", "replica", "demoted"],
         help="Name of the new role of this node (automatically filled by "
              "Patroni)",
     )
@@ -209,7 +209,7 @@ def main() -> None:
         choices=["promoted", "demoted", "always"],
         help="Controls under which circumstances the 'on_role_change' callback "
              "should actually switch config in Barman. 'promoted' means the "
-             "'role' is either 'master', 'primary' or 'promoted'. 'demoted' "
+             "'role' is either 'primary' or 'promoted'. 'demoted' "
              "means the 'role' is either 'replica' or 'demoted' "
              "(default: '%(default)s')",
         dest="switch_when",

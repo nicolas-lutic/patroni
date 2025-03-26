@@ -9,22 +9,26 @@ import random
 import socket
 import tempfile
 import time
-import urllib3
-import yaml
 
 from collections import defaultdict
 from copy import deepcopy
 from http.client import HTTPException
-from urllib3.exceptions import HTTPError
 from threading import Condition, Lock, Thread
-from typing import Any, Callable, Collection, Dict, List, Optional, Tuple, Type, Union, TYPE_CHECKING
+from typing import Any, Callable, Collection, Dict, List, Optional, Tuple, Type, TYPE_CHECKING, Union
 
-from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, Status, SyncState, TimelineHistory
+import urllib3
+import yaml
+
+from urllib3.exceptions import HTTPError
+
 from ..collections import EMPTY_DICT
 from ..exceptions import DCSError
+from ..postgresql.misc import PostgresqlState
 from ..postgresql.mpp import AbstractMPP
-from ..utils import deep_compare, iter_response_objects, keepalive_socket_options, \
-    Retry, RetryFailedError, tzutc, uri, USER_AGENT
+from ..utils import deep_compare, iter_response_objects, \
+    keepalive_socket_options, Retry, RetryFailedError, tzutc, uri, USER_AGENT
+from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, Status, SyncState, TimelineHistory
+
 if TYPE_CHECKING:  # pragma: no cover
     from ..config import Config
 
@@ -645,7 +649,7 @@ class ObjectCache(Thread):
         with self._object_cache_lock:
             return self._object_cache.get(name)
 
-    def _process_event(self, event: Dict[str, Union[Any, Dict[str, Union[Any, Dict[str, Any]]]]]) -> None:
+    def _process_event(self, event: Dict[str, Any]) -> None:
         ev_type = event['type']
         obj = event['object']
         name = obj['metadata']['name']
@@ -753,10 +757,12 @@ class Kubernetes(AbstractDCS):
         self._label_selector = ','.join('{0}={1}'.format(k, v) for k, v in self._labels.items())
         self._namespace = config.get('namespace') or 'default'
         self._role_label = config.get('role_label', 'role')
-        self._leader_label_value = config.get('leader_label_value', 'master')
+        self._leader_label_value = config.get('leader_label_value', 'primary')
         self._follower_label_value = config.get('follower_label_value', 'replica')
-        self._standby_leader_label_value = config.get('standby_leader_label_value', 'master')
+        self._standby_leader_label_value = config.get('standby_leader_label_value', 'primary')
         self._tmp_role_label = config.get('tmp_role_label')
+        self._bootstrap_labels: Dict[str, str] = {str(k): str(v)
+                                                  for k, v in (config.get('bootstrap_labels') or EMPTY_DICT).items()}
         self._ca_certs = os.environ.get('PATRONI_KUBERNETES_CACERT', config.get('cacert')) or SERVICE_CERT_FILENAME
         super(Kubernetes, self).__init__({**config, 'namespace': ''}, mpp)
         if self._mpp.is_enabled():
@@ -1047,7 +1053,7 @@ class Kubernetes(AbstractDCS):
         return False
 
     def __target_ref(self, leader_ip: str, latest_subsets: List[K8sObject], pod: K8sObject) -> K8sObject:
-        # we want to re-use existing target_ref if possible
+        # we want to reuse existing target_ref if possible
         empty_addresses: List[K8sObject] = []
         for subset in latest_subsets:
             for address in subset.addresses or empty_addresses:
@@ -1212,9 +1218,6 @@ class Kubernetes(AbstractDCS):
 
         self._kinds.set(self.leader_path, kind)
 
-        if not retry.ensure_deadline(0.5):
-            return False
-
         kind_annotations = kind and kind.metadata.annotations or EMPTY_DICT
         kind_resource_version = kind and kind.metadata.resource_version
 
@@ -1222,10 +1225,18 @@ class Kubernetes(AbstractDCS):
         if kind and (kind_annotations.get(self._LEADER) != self._name or kind_resource_version == resource_version):
             return False
 
+        # We can get 409 because we do at least one retry, and the first update might have succeeded,
+        # therefore we will check if annotations on the read object match expectations.
+        if all(kind_annotations.get(k) == v for k, v in annotations.items()):
+            return True
+
+        if not retry.ensure_deadline(0.5):
+            return False
+
         return bool(_run_and_handle_exceptions(self._patch_or_create, self.leader_path, annotations,
                                                kind_resource_version, ips=ips, retry=_retry))
 
-    def update_leader(self, leader: Leader, last_lsn: Optional[int],
+    def update_leader(self, cluster: Cluster, last_lsn: Optional[int],
                       slots: Optional[Dict[str, int]] = None, failsafe: Optional[Dict[str, str]] = None) -> bool:
         kind = self._kinds.get(self.leader_path)
         kind_annotations = kind and kind.metadata.annotations or EMPTY_DICT
@@ -1241,6 +1252,8 @@ class Kubernetes(AbstractDCS):
         if last_lsn:
             annotations[self._OPTIME] = str(last_lsn)
             annotations['slots'] = json.dumps(slots, separators=(',', ':')) if slots else None
+            retain_slots = self._build_retain_slots(cluster, slots)
+            annotations['retain_slots'] = json.dumps(retain_slots) if retain_slots else None
 
         if failsafe is not None:
             annotations[self._FAILSAFE] = json.dumps(failsafe, separators=(',', ':')) if failsafe else None
@@ -1307,27 +1320,34 @@ class Kubernetes(AbstractDCS):
         cluster = self.cluster
         if cluster and cluster.leader and cluster.leader.name == self._name:
             role = self._standby_leader_label_value if data['role'] == 'standby_leader' else self._leader_label_value
-            tmp_role = 'master'
-        elif data['state'] == 'running' and data['role'] not in ('master', 'primary'):
+            tmp_role = 'primary'
+        elif data['state'] == PostgresqlState.RUNNING and data['role'] != 'primary':
             role = {'replica': self._follower_label_value}.get(data['role'], data['role'])
             tmp_role = data['role']
         else:
             role = None
             tmp_role = None
 
-        role_labels = {self._role_label: role}
+        updated_labels = {self._role_label: role}
         if self._tmp_role_label:
-            role_labels[self._tmp_role_label] = tmp_role
+            updated_labels[self._tmp_role_label] = tmp_role
+
+        if self._bootstrap_labels:
+            if data['state'] in (PostgresqlState.INITDB, PostgresqlState.CUSTOM_BOOTSTRAP,
+                                 PostgresqlState.BOOTSTRAP_STARTING, PostgresqlState.CREATING_REPLICA):
+                updated_labels.update(self._bootstrap_labels)
+            else:
+                updated_labels.update({k: None for k, _ in self._bootstrap_labels.items()})
 
         member = cluster and cluster.get_member(self._name, fallback_to_leader=False)
         pod_labels = member and member.data.pop('pod_labels', None)
         ret = member and pod_labels is not None\
-            and all(pod_labels.get(k) == v for k, v in role_labels.items())\
+            and all(pod_labels.get(k) == v for k, v in updated_labels.items())\
             and deep_compare(data, member.data)
 
         if not ret:
-            metadata = {'namespace': self._namespace, 'name': self._name, 'labels': role_labels,
-                        'annotations': {'status': json.dumps(data, separators=(',', ':'))}}
+            metadata: Dict[str, Any] = {'namespace': self._namespace, 'name': self._name, 'labels': updated_labels,
+                                        'annotations': {'status': json.dumps(data, separators=(',', ':'))}}
             body = k8s_client.V1Pod(metadata=k8s_client.V1ObjectMeta(**metadata))
             ret = self._api.patch_namespaced_pod(self._name, self._namespace, body)
             if ret:
@@ -1373,15 +1393,18 @@ class Kubernetes(AbstractDCS):
         raise NotImplementedError  # pragma: no cover
 
     def write_sync_state(self, leader: Optional[str], sync_standby: Optional[Collection[str]],
-                         version: Optional[str] = None) -> Optional[SyncState]:
+                         quorum: Optional[int], version: Optional[str] = None) -> Optional[SyncState]:
         """Prepare and write annotations to $SCOPE-sync Endpoint or ConfigMap.
 
         :param leader: name of the leader node that manages /sync key
         :param sync_standby: collection of currently known synchronous standby node names
+        :param quorum: if the node from sync_standby list is doing a leader race it should
+                       see at least quorum other nodes from the sync_standby + leader list
         :param version: last known `resource_version` for conditional update of the object
         :returns: the new :class:`SyncState` object or None
         """
-        sync_state = self.sync_state(leader, sync_standby)
+        sync_state = self.sync_state(leader, sync_standby, quorum)
+        sync_state['quorum'] = str(sync_state['quorum']) if sync_state['quorum'] is not None else None
         ret = self.patch_or_create(self.sync_path, sync_state, version, False)
         if not isinstance(ret, bool):
             return SyncState.from_node(ret.metadata.resource_version, sync_state)
@@ -1393,7 +1416,7 @@ class Kubernetes(AbstractDCS):
         :param version: last known `resource_version` for conditional update of the object
         :returns: `True` if "delete" was successful
         """
-        return self.write_sync_state(None, None, version=version) is not None
+        return self.write_sync_state(None, None, None, version=version) is not None
 
     def watch(self, leader_version: Optional[str], timeout: float) -> bool:
         if self.__do_not_watch:
